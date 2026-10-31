@@ -40,7 +40,10 @@ gallery page at /, later: labeling UI + training exports.
    X-Device-Id xiao-<mac tail>; serial byte counts match stored file sizes exactly.
    Secrets in main/secrets.h (gitignored; .example provided). Laptop is wired on en0 —
    same LAN as the WiFi, reachable. Port note: re-enumerates on replug (currently usbmodem11301).
-4. **Training loop offline** — label probes (binary clicker in gallery), fine-tune ImageNet-pretrained MobileNetV3-Small, quantize int8.
+4. **Training loop offline** — tooling DONE 2026-10-31: /label clicker (b/n keys, auto-advance
+   to next unlabeled, progress counter), labels in ingest/labels.db (tracked in git),
+   /export.csv (path,label), gallery shows label colors. Verified via curl + real browser.
+   Remaining: fine-tune MobileNetV3-Small + quantize once real-scene frames accumulate.
 5. **On-device gating** — flash model, probe loop @1-2 fps, debounce + burst capture on bird edges.
 6. **Pi deployment** — same ingest service on the Pi, point device at it. Hardening: retries, buffers.
 
