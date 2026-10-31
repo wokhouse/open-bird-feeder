@@ -35,7 +35,11 @@ gallery page at /, later: labeling UI + training exports.
 2. **Ingest service** — DONE 2026-10-31: FastAPI /upload (photo+probe kinds) verified via
    curl (exact byte round-trip), gallery + static serving return 200. Runs on :8077 via
    ingest/run.sh. Pitfall fixed: StaticFiles mount needs DATA dir to exist at import.
-3. **Capture+upload loop** — WiFi (U.FL!), POST photo+probe to laptop LAN IP :8077. Doubles as data collection.
+3. **Capture+upload loop** — DONE 2026-10-31: firmware joins sleepycatwifi (U.FL fitted,
+   +heatsink), POSTs XGA JPEG every 8 s to http://<laptop en0>:8077/upload?kind=photo with
+   X-Device-Id xiao-<mac tail>; serial byte counts match stored file sizes exactly.
+   Secrets in main/secrets.h (gitignored; .example provided). Laptop is wired on en0 —
+   same LAN as the WiFi, reachable. Port note: re-enumerates on replug (currently usbmodem11301).
 4. **Training loop offline** — label probes (binary clicker in gallery), fine-tune ImageNet-pretrained MobileNetV3-Small, quantize int8.
 5. **On-device gating** — flash model, probe loop @1-2 fps, debounce + burst capture on bird edges.
 6. **Pi deployment** — same ingest service on the Pi, point device at it. Hardening: retries, buffers.
