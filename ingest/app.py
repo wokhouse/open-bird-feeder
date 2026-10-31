@@ -14,6 +14,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
 
 DATA = Path(os.environ.get("INGEST_DATA", Path(__file__).parent / "data")).resolve()
+DATA.mkdir(parents=True, exist_ok=True)  # StaticFiles refuses a missing dir at mount time
 SAFE = lambda s: "".join(c for c in s if c.isalnum() or c in "-_.")[:48] or "unknown"
 
 app = FastAPI(title="open-birdhouse ingest")
