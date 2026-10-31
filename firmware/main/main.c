@@ -41,7 +41,7 @@ static const char *TAG = "birdcam";
 #define CAM_PIN_HREF  GPIO_NUM_47
 #define CAM_PIN_PCLK  GPIO_NUM_13
 
-#define SHOT_INTERVAL_MS 8000
+#define SHOT_INTERVAL_MS 60000
 #define WIFI_CONNECTED_BIT BIT0
 
 static EventGroupHandle_t s_wifi_events;
