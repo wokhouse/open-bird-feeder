@@ -3,10 +3,10 @@
 Upload + Kimi classification + manual review for the bird training set.
 
 Image states: unclassified (no stored row) | no_bird | bird_identified |
-species_identified. Every classification carries provenance: manual vs kimi,
+species_identified. Every classification carries provenance: manual vs ai,
 which model, confidence, note. Manual review always wins locally; re-running
-Kimi replaces only kimi-sourced rows... (it replaces the row either way in v0;
-manual-vs-kimi precedence is a hardening TODO in PLAN.md).
+AI re-runs replace the row either way in v0;
+manual-vs-AI precedence is a hardening TODO in PLAN.md).
 
 Endpoints:
   POST /upload?kind=photo|probe      raw JPEG body; headers: X-Device-Id
@@ -27,7 +27,7 @@ import os
 import sqlite3
 from pathlib import Path
 
-import kimi
+import llm
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import PlainTextResponse
 from fastapi.staticfiles import StaticFiles
@@ -146,7 +146,7 @@ def apply_verdict(rel: str, v: dict) -> str:
         state = "species_identified"
     else:
         state = "bird_identified"
-    set_row(rel, state, "kimi", v["species"], v["confidence"], v["note"], v["model"])
+    set_row(rel, state, "ai", v["species"], v["confidence"], v["note"], v["model"])
     return state
 
 
@@ -168,14 +168,14 @@ async def set_state(request: Request):
     return {"ok": True, "path": rel, "state": state, "species": species}
 
 
-async def run_kimi(rel: str) -> dict:
-    if not kimi.configured():
-        raise HTTPException(502, f"kimi not configured: set {kimi.KEY_ENV} in ingest/.env")
+async def run_llm(rel: str) -> dict:
+    if not llm.configured():
+        raise HTTPException(502, f"AI not configured: set {llm.KEY_ENV} in ingest/.env")
     jpeg = (DATA / rel).read_bytes()
     try:
-        verdict = kimi.classify(jpeg)
+        verdict = llm.classify(jpeg)
     except Exception as e:  # upstream hiccup: surface it, never poison the store
-        raise HTTPException(502, f"kimi call failed: {e}")
+        raise HTTPException(502, f"AI call failed: {e}")
     state = apply_verdict(rel, verdict)
     return {"path": rel, "state": state, **verdict}
 
@@ -183,7 +183,7 @@ async def run_kimi(rel: str) -> dict:
 @app.post("/api/classify")
 async def classify(request: Request):
     body = await request.json()
-    return await run_kimi(safe_relpath(str(body.get("path", ""))))
+    return await run_llm(safe_relpath(str(body.get("path", ""))))
 
 
 @app.post("/api/classify_pending")
@@ -194,7 +194,7 @@ async def classify_pending(request: Request):
         body = {}
     limit = max(1, min(int(body.get("limit", 10)), 50))
     unclassified = [r["path"] for r in rows() if r["state"] == "unclassified"]
-    results = [await run_kimi(p) for p in unclassified[:limit]]
+    results = [await run_llm(p) for p in unclassified[:limit]]
     return {"classified": len(results), "results": results}
 
 
@@ -216,12 +216,8 @@ def export_csv():
     buf = io.StringIO()
     w = csv.writer(buf)
     w.writerow(["path", "state", "species", "source", "confidence", "note"])
-    with db() as conn:
-        for r in conn.execute(
-            "SELECT path,state,species,source,confidence,note FROM classifications "
-            "ORDER BY path"
-        ):
-            w.writerow(r)
+    for r in rows():  # rows() skips labels whose file is gone (e.g. trashed frames)
+        w.writerow([r[c] for c in ("path", "state", "species", "source", "confidence", "note")])
     return buf.getvalue()
 
 

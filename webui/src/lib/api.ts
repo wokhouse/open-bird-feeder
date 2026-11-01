@@ -8,7 +8,7 @@ export interface Img {
   path: string
   state: State
   species: string | null
-  source: string | null // manual | kimi
+  source: string | null // manual | ai (legacy rows: 'kimi')
   confidence: number | null
   note: string | null
 }
@@ -45,6 +45,6 @@ export const getImages = (): Promise<Img[]> => fetch('/api/images').then(j)
 export const getStats = (): Promise<Stats> => fetch('/api/stats').then(j)
 export const setState = (path: string, state: State, species?: string) =>
   post('/api/set_state', { path, state, species })
-export const classifyWithKimi = (path: string) => post('/api/classify', { path })
+export const classifyWithAI = (path: string) => post('/api/classify', { path })
 export const classifyPending = (limit: number) =>
   post('/api/classify_pending', { limit })

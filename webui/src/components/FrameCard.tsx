@@ -10,7 +10,7 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
-import { classifyWithKimi, setState, type Img, type State } from '@/lib/api'
+import { classifyWithAI, setState, type Img, type State } from '@/lib/api'
 
 export function stateBadge(img: Img) {
   switch (img.state) {
@@ -72,7 +72,7 @@ export default function FrameCard({
           {stateBadge(img)}
           {img.source && (
             <span className="text-xs text-muted-foreground">
-              via {img.source}
+              via {img.source === 'kimi' || img.source === 'ai' ? 'AI' : img.source}
               {img.confidence != null &&
                 ` · ${(img.confidence * 100).toFixed(0)}%`}
             </span>
@@ -99,8 +99,8 @@ export default function FrameCard({
           >
             <Tag className="size-3.5" /> species
           </Button>
-          <Button size="sm" disabled={busy} onClick={() => act(() => classifyWithKimi(img.path))}>
-            <Sparkles className="size-3.5" /> {busy ? '…' : 'kimi'}
+          <Button size="sm" disabled={busy} onClick={() => act(() => classifyWithAI(img.path))} title="AI classify" aria-label="AI classify">
+            <Sparkles className="size-3.5" />
           </Button>
           {img.state !== 'unclassified' && (
             <Button size="sm" variant="ghost" disabled={busy} onClick={() => mark('unclassified')}>
@@ -136,7 +136,7 @@ export default function FrameCard({
             />
             {img.note && (
               <p className="text-xs text-muted-foreground">
-                kimi note: {img.note}
+                AI note: {img.note}
               </p>
             )}
             <DialogFooter>

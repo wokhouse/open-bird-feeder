@@ -47,7 +47,7 @@ export default function App() {
     reload()
   }, [reload])
 
-  const runKimiBatch = async () => {
+  const runAIBatch = async () => {
     setClassifying(true)
     setError(null)
     try {
@@ -55,7 +55,7 @@ export default function App() {
       await reload()
     } catch (e) {
       setError(
-        errMsg(e) + ' — kimi needs MOONSHOT_API_KEY in ingest/.env',
+        errMsg(e) + ' — set LLM_API_KEY in ingest/.env',
       )
     } finally {
       setClassifying(false)
@@ -75,14 +75,14 @@ export default function App() {
           <h1 className="text-lg font-semibold">open-birdhouse review</h1>
           <p className="text-sm text-muted-foreground">
             {stats
-              ? `${stats.total} frames · ${stats.unclassified} awaiting kimi/review`
+              ? `${stats.total} frames · ${stats.unclassified} awaiting AI/review`
               : 'loading…'}
           </p>
         </div>
         <div className="flex gap-2">
-          <Button onClick={runKimiBatch} disabled={classifying}>
+          <Button onClick={runAIBatch} disabled={classifying}>
             <Sparkles className="size-4" />
-            {classifying ? 'kimi working…' : 'classify pending with kimi'}
+            {classifying ? 'processing…' : 'AI bulk process'}
           </Button>
           <Button variant="outline" onClick={reload}>
             <RefreshCw className="size-4" />
