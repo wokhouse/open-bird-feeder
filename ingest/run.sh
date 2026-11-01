@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# Create venv if needed and run the ingest service on 0.0.0.0:8077.
+# Create venv if needed and run the ingest service (reads ingest/.env first:
+# MOONSHOT_API_KEY, KIMI_MODEL, INGEST_DATA, PORT...).
 set -euo pipefail
 cd "$(dirname "$0")"
 [ -d .venv ] || { python3 -m venv .venv && .venv/bin/pip install -q -r requirements.txt; }
-exec .venv/bin/uvicorn app:app --reload --host 0.0.0.0 --port "${PORT:-8077}"
+if [ -f .env ]; then set -a; . ./.env; set +a; fi
+exec .venv/bin/uvicorn app:app --reload --host 0.0.0.0 --port "${PORT:-8078}"

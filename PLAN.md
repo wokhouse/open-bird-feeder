@@ -11,8 +11,12 @@ Device: OV2640/OV3660 low-res probe frames -> int8 bird/no-bird classifier
 capture XGA JPEG -> HTTP POST photo + probe frame + score. Timer-triggered
 mode stays as fallback / bootstrap data collection.
 
-Receiver (FastAPI): stores uploads under data/<kind>/<date>/HHMMSS_<device>.jpg,
-gallery page at /, later: labeling UI + training exports.
+Receiver (FastAPI): stores uploads under data/<kind>/<date>/HHMMSS_<device>.jpg.
+Review UI: Vite+React+Tailwind+shadcn SPA (webui/) served from webui/dist at /.
+Classification states: unclassified / no_bird / bird_identified / species_identified,
+each row carrying provenance (manual|kimi, model, confidence, note) in ingest/labels.db.
+Kimi (Moonshot vision API, ingest/kimi.py) makes the bird/no-bird + species call;
+manual review always wins locally. Needs MOONSHOT_API_KEY in ingest/.env.
 
 ## Hardware facts (verified this session)
 
@@ -40,9 +44,14 @@ gallery page at /, later: labeling UI + training exports.
    X-Device-Id xiao-<mac tail>; serial byte counts match stored file sizes exactly.
    Secrets in main/secrets.h (gitignored; .example provided). Laptop is wired on en0 —
    same LAN as the WiFi, reachable. Port note: re-enumerates on replug (currently usbmodem11301).
-4. **Training loop offline** — tooling DONE 2026-10-31: /label clicker (b/n keys, auto-advance
-   to next unlabeled, progress counter), labels in ingest/labels.db (tracked in git),
-   /export.csv (path,label), gallery shows label colors. Verified via curl + real browser.
+4. **Training loop offline** — tooling DONE 2026-10-31: v1 clicker superseded by the
+   branch-keen-kestrel pipeline: state model + provenance in labels.db (v1 binary labels
+   auto-migrate at startup; sqlite WAL + startup-only migration after a lock race),
+   kimi.py vision client (base64 image_url; URL-form images unsupported), /api/classify[_pending],
+   review SPA with filter tabs, per-frame kimi/manual actions, species dialog, CSV export
+   (path,state,species,source,confidence,note). Verified via curl + real browser; SPA build clean.
+   Dev runs: ingest on :8077 (device unchanged), vite dev on :5173 proxying /api,/files.
+   TODO: add MOONSHOT_API_KEY to ingest/.env (see .env.example) and batch-classify.
    Remaining: fine-tune MobileNetV3-Small + quantize once real-scene frames accumulate.
 5. **On-device gating** — flash model, probe loop @1-2 fps, debounce + burst capture on bird edges.
 6. **Pi deployment** — same ingest service on the Pi, point device at it. Hardening: retries, buffers.
@@ -53,5 +62,6 @@ of on-device model — pipeline is the same either way.
 ## Layout
 
 - firmware/   ESP-IDF project (esp32-camera managed component)
-- ingest/     FastAPI ingest + gallery
+- ingest/     FastAPI ingest + classification API + kimi client
+- webui/      review SPA (Vite + React + TS + Tailwind v4 + shadcn)
 - scripts/    host tooling (grab_photo.py, ...)
