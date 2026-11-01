@@ -44,6 +44,13 @@ manual review always wins locally. Needs MOONSHOT_API_KEY in ingest/.env.
    X-Device-Id xiao-<mac tail>; serial byte counts match stored file sizes exactly.
    Secrets in main/secrets.h (gitignored; .example provided). Laptop is wired on en0 —
    same LAN as the WiFi, reachable. Port note: re-enumerates on replug (currently usbmodem11301).
+   3b **Deep-sleep cadence** — BUILT (not yet flashed): every wake = cold boot from deep
+   sleep every 60 s: WiFi join (fast-join via BSSID/channel cached in RTC-slow mem,
+   full-scan fallback), camera init, 2 warmup frames discarded, 1 XGA JPEG POSTed
+   (+1 retry), OV3660 software standby (SCCB 0x3008 bit6 — same board/sensor measures
+   ~1.5 mA asleep vs 22-38 mA if left running; OV2640 can't standby), then
+   esp_deep_sleep_start(). BOOTLOADER_SKIP_VALIDATE_IN_DEEP_SLEEP trims boot.
+   Any failure path (WiFi/camera/upload) still sleeps the full 60 s — fixed cadence.
 4. **Training loop offline** — tooling DONE 2026-10-31: v1 clicker superseded by the
    branch-keen-kestrel pipeline: state model + provenance in labels.db (v1 binary labels
    auto-migrate at startup; sqlite WAL + startup-only migration after a lock race),
