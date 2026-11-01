@@ -81,29 +81,32 @@ export default function FrameCard({
         {img.note && (
           <p className="text-xs text-muted-foreground">{img.note}</p>
         )}
-        <div className="flex flex-wrap gap-1">
-          <Button size="sm" variant="outline" disabled={busy} onClick={() => mark('no_bird')}>
-            <Ban className="size-3.5" /> no bird
+        <div className="flex gap-1">
+          <Button size="sm" variant="outline" className="px-2" disabled={busy} onClick={() => mark('no_bird')} title="No bird" aria-label="No bird">
+            <Ban className="size-3.5" />
           </Button>
-          <Button size="sm" variant="outline" disabled={busy} onClick={() => mark('bird_identified')}>
-            <Bird className="size-3.5" /> bird
+          <Button size="sm" variant="outline" className="px-2" disabled={busy} onClick={() => mark('bird_identified')} title="Bird" aria-label="Bird">
+            <Bird className="size-3.5" />
           </Button>
           <Button
             size="sm"
             variant="outline"
+            className="px-2"
             disabled={busy}
+            title="Mark species"
+            aria-label="Mark species"
             onClick={() => {
               setSpecies(img.species ?? '')
               setSpeciesOpen(true)
             }}
           >
-            <Tag className="size-3.5" /> species
+            <Tag className="size-3.5" />
           </Button>
-          <Button size="sm" disabled={busy} onClick={() => act(() => classifyWithAI(img.path))} title="AI classify" aria-label="AI classify">
+          <Button size="sm" className="px-2" disabled={busy} onClick={() => act(() => classifyWithAI(img.path))} title="AI classify" aria-label="AI classify">
             <Sparkles className="size-3.5" />
           </Button>
           {img.state !== 'unclassified' && (
-            <Button size="sm" variant="ghost" disabled={busy} onClick={() => mark('unclassified')}>
+            <Button size="sm" variant="ghost" className="px-2" disabled={busy} onClick={() => mark('unclassified')} title="Clear to unclassified" aria-label="Clear to unclassified">
               <RotateCcw className="size-3.5" />
             </Button>
           )}
