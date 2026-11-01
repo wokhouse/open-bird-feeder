@@ -11,6 +11,7 @@ export interface Img {
   source: string | null // manual | ai (legacy rows: 'kimi')
   confidence: number | null
   note: string | null
+  box: [number, number, number, number] | null // AI bbox, normalized 0..1 [x1,y1,x2,y2]
 }
 
 export interface Stats {
