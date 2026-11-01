@@ -76,7 +76,9 @@ def now() -> str:
 
 
 def list_images() -> list[str]:
-    return sorted(str(p.relative_to(DATA)) for p in DATA.rglob("*.jpg"))
+    """Review/training frames only. data/probe/ holds detector diagnostics
+    (the grayscale frame that triggered a capture), not bird photos."""
+    return sorted(str(p.relative_to(DATA)) for p in (DATA / "photo").rglob("*.jpg"))
 
 
 def safe_relpath(rel: str) -> str:

@@ -6,10 +6,12 @@ Hardwired to power; on-device bird/no-bird model gates capture.
 
 ## Architecture
 
-Device: OV2640/OV3660 low-res probe frames -> int8 bird/no-bird classifier
-(tflite-micro + esp-nn, ~1-2 fps) -> on bird-present edge (debounced):
-capture XGA JPEG -> HTTP POST photo + probe frame + score. Timer-triggered
-mode stays as fallback / bootstrap data collection.
+Device: OV2640/OV3660 grayscale QQVGA probe frames at ~6.6 fps -> zone motion
+detector (firmware/main/zone_motion.c) -> on zone change (debounced, refractory
+4 s): capture XGA JPEG -> HTTP POST photo + the probe frame that triggered it +
+cell scores. Heartbeat photo every 15 min as fallback / liveness.
+Later phase 5b replaces the motion gate with an int8 bird/no-bird classifier
+(tflite-micro + esp-nn); the capture/upload path stays the same.
 
 Receiver (FastAPI): stores uploads under data/<kind>/<date>/HHMMSS_<device>.jpg.
 Review UI: Vite+React+Tailwind+shadcn SPA (webui/) served from webui/dist at /.
@@ -53,7 +55,30 @@ manual review always wins locally. Needs MOONSHOT_API_KEY in ingest/.env.
    Dev runs: ingest on :8077 (device unchanged), vite dev on :5173 proxying /api,/files.
    TODO: add MOONSHOT_API_KEY to ingest/.env (see .env.example) and batch-classify.
    Remaining: fine-tune MobileNetV3-Small + quantize once real-scene frames accumulate.
-5. **On-device gating** — flash model, probe loop @1-2 fps, debounce + burst capture on bird edges.
+5a. **Zone motion gating** — DONE 2026-11-01: camera runs PIXFORMAT_GRAYSCALE/QQVGA
+   (160x120) at 150 ms (~6.6 fps); each frame is compared with the previous one
+   inside the seed zone only, so leaves/cars/buildings in the background never
+   count. Zone = firmware/main/zone_config.h, as percent of the frame: x 0-100%,
+   y 62-100% (tray rim + seed pile; measured from the mounted view, sharpness
+   peaks at 65-75% height). Cell 4 px, cell mean |diff| >= 14 counts as hot,
+   6 hot cells = motion, 2 consecutive motion frames = capture. The zone-wide
+   mean |diff| is subtracted from every cell, so exposure/cloud jumps do not
+   trigger. On capture: switch to JPEG XGA (3 settle frames for AEC), upload
+   photo, switch back to probe, reset the reference frame. The triggering probe
+   frame is uploaded as kind=probe (diag only; ingest keeps probe/ out of the
+   gallery and training set). Verified: firmware builds (app 0.98 MB of a 3 MB
+   partition, 38% DRAM), `make -C firmware/test run` passes 12 assertions on the
+   firmware source, and the same binary run on real frames (her feeder photo ->
+   QQVGA gray) scores 12 hot cells for a bird in the zone, 0 for a bird-sized
+   blob in the background, 0 for global +20 brightness, 0 for a 3 px leaf shift.
+   Tuning tool: `uv run --with numpy --with pillow scripts/zone_preview.py
+   photo.jpg --pair after.jpg` draws the live zone and scores the pair.
+   Pitfall: the default single-app partition table gives the app 1 MB and the
+   build was at 4% free; firmware/partitions.csv (3 MB app) is now the default,
+   so flashing the new table is required before the phase-5b model lands.
+5b. **On-device gating (classifier)** — train bird/no-bird on the real mounting
+   scene (negatives = the actual background), flash int8 model, probe loop
+   replaced by the classifier, debounce + burst capture on bird edges.
 6. **Pi deployment** — same ingest service on the Pi, point device at it. Hardening: retries, buffers.
 
 Decision at end of Phase 3 (alt): stream probes to Pi for a real detector instead
@@ -62,6 +87,10 @@ of on-device model — pipeline is the same either way.
 ## Layout
 
 - firmware/   ESP-IDF project (esp32-camera managed component)
+  - main/zone_motion.c   zone frame-differencing detector (no IDF deps)
+  - main/zone_config.h   zone rect + thresholds, the only knobs for tuning
+  - test/                host gcc harness for the same detector source
+  - partitions.csv       3 MB app partition (default 1 MB is too small)
 - ingest/     FastAPI ingest + classification API + kimi client
 - webui/      review SPA (Vite + React + TS + Tailwind v4 + shadcn)
-- scripts/    host tooling (grab_photo.py, ...)
+- scripts/    host tooling (grab_photo.py, zone_preview.py)

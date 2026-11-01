@@ -7,3 +7,6 @@ CONFIG_SPIRAM_SPEED_80M=y
 CONFIG_ESP32S3_DEFAULT_CPU_FREQ_240=y
 # Console on the native USB-Serial/JTAG CDC port (/dev/cu.usbmodem*)
 CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+# Custom table: 3MB app partition (default single-app is 1MB)
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"

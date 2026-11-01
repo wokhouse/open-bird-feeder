@@ -1,12 +1,18 @@
-// Phase 3: XIAO ESP32S3 Sense birdcam — capture XGA JPEG, upload to the
-// network ingest service (see PLAN.md). Credentials/URL live in secrets.h.
+// Phase 5: XIAO ESP32S3 Sense birdcam — zone motion gating.
 //
-// Behaviour: join WiFi (auto-reconnect), then every SHOT_INTERVAL_MS grab a
-// frame and HTTP-POST it to INGEST_BASE/upload?kind=photo with an
-// X-Device-Id header derived from the MAC. Console logs on USB-CDC only.
+// The camera runs in low-res grayscale "probe" mode. Each probe frame is
+// compared with the previous one inside the seed zone only (zone_config.h), so
+// leaves, cars and buildings moving in the background do not count. When the
+// zone changes for ZONE_TRIGGER_FRAMES frames in a row the camera switches to
+// JPEG XGA, grabs one photo, uploads it, and returns to probe mode.
+// A heartbeat photo every HEARTBEAT_MS keeps the timer path alive for
+// troubleshooting (set HEARTBEAT_MS to 0 to disable).
+//
+// Credentials/URL live in secrets.h. Console is USB-CDC only.
 
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -18,10 +24,14 @@
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_netif.h"
+#include "esp_timer.h"
 #include "esp_wifi.h"
+#include "img_converters.h"
 #include "nvs_flash.h"
 
 #include "secrets.h"
+#include "zone_config.h"
+#include "zone_motion.h"
 
 static const char *TAG = "birdcam";
 
@@ -41,13 +51,31 @@ static const char *TAG = "birdcam";
 #define CAM_PIN_HREF  GPIO_NUM_47
 #define CAM_PIN_PCLK  GPIO_NUM_13
 
-#define SHOT_INTERVAL_MS 60000
+/* Probe (motion) mode: small grayscale frames, several per second. Must match
+ * the zone geometry only through percentages, so changing this size is safe. */
+#define PROBE_FRAMESIZE   FRAMESIZE_QQVGA /* 160x120 */
+#define PROBE_PIXFORMAT   PIXFORMAT_GRAYSCALE
+#define PROBE_INTERVAL_MS 150             /* ~6.6 fps */
+#define PROBE_SETTLE      2               /* frames discarded after each switch */
+#define PROBE_JPEG_QUALITY 40             /* upload of the frame that triggered */
+
+/* Photo mode: one XGA frame per capture. */
+#define PHOTO_FRAMESIZE   FRAMESIZE_XGA /* 1024x768 */
+#define PHOTO_JPEG_QUALITY 12
+#define PHOTO_SETTLE      3 /* let auto-exposure converge after the mode switch */
+
+#define REFRACTORY_MS 4000  /* ignore motion this long after a capture */
+#define HEARTBEAT_MS  900000 /* 15 min: one photo when nothing moves (0 = off) */
+#define LOG_EVERY_FRAMES 400 /* one info line per ~60 s of probing */
+
 #define WIFI_CONNECTED_BIT BIT0
 
 static EventGroupHandle_t s_wifi_events;
 static char s_device_id[24];
+static zone_motion_t s_zone;
+static bool s_zone_ready;
 
-static esp_err_t camera_init(void)
+static esp_err_t camera_start(pixformat_t format, framesize_t size, int quality, int settle)
 {
     camera_config_t config = {
         .pin_pwdn     = -1,
@@ -69,14 +97,32 @@ static esp_err_t camera_init(void)
         .xclk_freq_hz = 20000000,
         .ledc_timer   = LEDC_TIMER_0,
         .ledc_channel = LEDC_CHANNEL_0,
-        .pixel_format = PIXFORMAT_JPEG,
-        .frame_size   = FRAMESIZE_XGA, /* 1024x768 */
-        .jpeg_quality = 12,
+        .pixel_format = format,
+        .frame_size   = size,
+        .jpeg_quality = quality,
         .fb_count     = 2,
         .fb_location  = CAMERA_FB_IN_PSRAM,
         .grab_mode    = CAMERA_GRAB_LATEST,
     };
-    return esp_camera_init(&config);
+
+    esp_err_t err = esp_camera_init(&config);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "camera init failed: %s", esp_err_to_name(err));
+        return err;
+    }
+    /* The first frames after a format switch can be partial or stale. */
+    for (int i = 0; i < settle; i++) {
+        camera_fb_t *fb = esp_camera_fb_get();
+        if (fb) esp_camera_fb_return(fb);
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    return ESP_OK;
+}
+
+static void camera_stop(void)
+{
+    esp_camera_deinit();
+    vTaskDelay(pdMS_TO_TICKS(100));
 }
 
 static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
@@ -122,8 +168,10 @@ static void wifi_connect_blocking(void)
     }
 }
 
-/* POST one frame to the ingest service. Returns true on HTTP 200. */
-static bool upload_frame(const camera_fb_t *fb, const char *kind)
+/* POST a buffer to the ingest service. hot/global < 0 = no motion headers.
+ * Returns true on HTTP 200. */
+static bool upload_bytes(const uint8_t *buf, size_t len, const char *kind,
+                         const char *content_type, int hot, int global)
 {
     char url[128];
     snprintf(url, sizeof(url), "%s/upload?kind=%s", INGEST_BASE, kind);
@@ -136,9 +184,18 @@ static bool upload_frame(const camera_fb_t *fb, const char *kind)
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
     if (!client) return false;
 
-    esp_http_client_set_header(client, "Content-Type", "image/jpeg");
+    char num[16];
+    esp_http_client_set_header(client, "Content-Type", content_type);
     esp_http_client_set_header(client, "X-Device-Id", s_device_id);
-    esp_http_client_set_post_field(client, (const char *)fb->buf, fb->len);
+    if (hot >= 0) {
+        snprintf(num, sizeof(num), "%d", hot);
+        esp_http_client_set_header(client, "X-Motion-Hot", num);
+    }
+    if (global >= 0) {
+        snprintf(num, sizeof(num), "%d", global);
+        esp_http_client_set_header(client, "X-Motion-Global", num);
+    }
+    esp_http_client_set_post_field(client, (const char *)buf, len);
 
     bool ok = false;
     esp_err_t err = esp_http_client_perform(client);
@@ -146,10 +203,79 @@ static bool upload_frame(const camera_fb_t *fb, const char *kind)
     if (err == ESP_OK && status == 200) {
         ok = true;
     } else {
-        ESP_LOGE(TAG, "upload failed: err=%s status=%d", esp_err_to_name(err), status);
+        ESP_LOGE(TAG, "upload %s failed: err=%s status=%d", kind, esp_err_to_name(err), status);
     }
     esp_http_client_cleanup(client);
     return ok;
+}
+
+/* Upload the grayscale probe frame that triggered a capture, as small JPEG.
+ * Lets us see what the detector saw and retune the zone from real data. */
+static void upload_probe(const camera_fb_t *fb, const zone_result_t *r)
+{
+    uint8_t *jpg = NULL;
+    size_t jpg_len = 0;
+    if (!frame2jpg((camera_fb_t *)fb, PROBE_JPEG_QUALITY, &jpg, &jpg_len)) {
+        ESP_LOGW(TAG, "probe encode failed");
+        return;
+    }
+    bool ok = upload_bytes(jpg, jpg_len, "probe", "image/jpeg", r->hot_cells, r->global_mean);
+    ESP_LOGI(TAG, "probe %ux%u %u B -> %s (hot=%d global=%d)", fb->width, fb->height,
+             (unsigned)jpg_len, ok ? "OK" : "FAIL", r->hot_cells, r->global_mean);
+    free(jpg);
+}
+
+static esp_err_t probe_start(void)
+{
+    esp_err_t err = camera_start(PROBE_PIXFORMAT, PROBE_FRAMESIZE, 0, PROBE_SETTLE);
+    if (err == ESP_OK) zone_motion_reset(&s_zone);
+    return err;
+}
+
+/* Switch to photo mode, grab and upload one XGA JPEG, switch back to probe. */
+static bool capture_photo(const char *why, const zone_result_t *r)
+{
+    camera_stop();
+    if (camera_start(PIXFORMAT_JPEG, PHOTO_FRAMESIZE, PHOTO_JPEG_QUALITY, PHOTO_SETTLE) != ESP_OK) {
+        ESP_LOGE(TAG, "photo mode failed, back to probing");
+        probe_start();
+        return false;
+    }
+
+    camera_fb_t *fb = esp_camera_fb_get();
+    bool ok = false;
+    if (fb) {
+        ok = upload_bytes(fb->buf, fb->len, "photo", "image/jpeg", -1, -1);
+        ESP_LOGI(TAG, "%s photo: %u bytes -> %s (hot=%d global=%d)", why, (unsigned)fb->len,
+                 ok ? "OK" : "FAIL", r->hot_cells, r->global_mean);
+        esp_camera_fb_return(fb);
+    } else {
+        ESP_LOGE(TAG, "%s photo: frame grab failed", why);
+    }
+
+    camera_stop();
+    while (probe_start() != ESP_OK) {
+        ESP_LOGE(TAG, "probe mode failed, retrying in 2 s");
+        vTaskDelay(pdMS_TO_TICKS(2000));
+        camera_stop();
+    }
+    return ok;
+}
+
+static zone_cfg_t zone_config_from_header(int w, int h)
+{
+    zone_cfg_t c = {
+        .x0 = ZONE_X0_PCT * w / 100,
+        .x1 = ZONE_X1_PCT * w / 100,
+        .y0 = ZONE_Y0_PCT * h / 100,
+        .y1 = ZONE_Y1_PCT * h / 100,
+        .cell = ZONE_CELL,
+        .cell_thresh = ZONE_CELL_THRESH,
+        .min_hot_cells = ZONE_MIN_HOT_CELLS,
+        .trigger_frames = ZONE_TRIGGER_FRAMES,
+        .light_reject = ZONE_LIGHT_REJECT,
+    };
+    return c;
 }
 
 void app_main(void)
@@ -162,23 +288,75 @@ void app_main(void)
     ESP_ERROR_CHECK(nvs_flash_init());
     wifi_connect_blocking();
 
-    while (camera_init() != ESP_OK) {
+    while (camera_start(PROBE_PIXFORMAT, PROBE_FRAMESIZE, 0, PROBE_SETTLE) != ESP_OK) {
         ESP_LOGE(TAG, "camera init failed, retrying in 2 s");
         vTaskDelay(pdMS_TO_TICKS(2000));
+        camera_stop();
     }
-    ESP_LOGI(TAG, "camera ready, uploading every %d ms", SHOT_INTERVAL_MS);
+    ESP_LOGI(TAG, "probing at %.1f fps, heartbeat %d ms", 1000.0f / PROBE_INTERVAL_MS, HEARTBEAT_MS);
 
-    unsigned seq = 0;
+    int64_t last_capture_ms = esp_timer_get_time() / 1000;
+    unsigned captures = 0;
+
     while (true) {
         camera_fb_t *fb = esp_camera_fb_get();
         if (!fb) {
-            ESP_LOGE(TAG, "frame grab failed");
-            vTaskDelay(pdMS_TO_TICKS(1000));
+            ESP_LOGE(TAG, "probe grab failed");
+            vTaskDelay(pdMS_TO_TICKS(500));
             continue;
         }
-        bool ok = upload_frame(fb, "photo");
-        ESP_LOGI(TAG, "shot %u: %u bytes -> %s", seq++, (unsigned)fb->len, ok ? "OK" : "FAIL");
-        esp_camera_fb_return(fb);
-        vTaskDelay(pdMS_TO_TICKS(SHOT_INTERVAL_MS));
+        const int w = fb->width, h = fb->height;
+        if (fb->len < (size_t)w * (size_t)h) {
+            ESP_LOGW(TAG, "probe frame %ux%u len=%u unusable", w, h, (unsigned)fb->len);
+            esp_camera_fb_return(fb);
+            vTaskDelay(pdMS_TO_TICKS(PROBE_INTERVAL_MS));
+            continue;
+        }
+
+        /* Zone size follows the real probe frame, so PROBE_FRAMESIZE can change
+         * without touching the percentages in zone_config.h. */
+        if (!s_zone_ready || s_zone.w != w || s_zone.h != h) {
+            zone_motion_free(&s_zone);
+            zone_cfg_t zc = zone_config_from_header(w, h);
+            if (zone_motion_init(&s_zone, w, h, &zc) != 0) {
+                ESP_LOGE(TAG, "zone motion init failed (out of memory?)");
+                esp_camera_fb_return(fb);
+                esp_restart();
+            }
+            s_zone_ready = true;
+            ESP_LOGI(TAG, "zone %d,%d..%d,%d of %dx%d, cell=%d thresh=%d min_hot=%d",
+                     s_zone.cfg.x0, s_zone.cfg.y0, s_zone.cfg.x1, s_zone.cfg.y1, w, h,
+                     s_zone.cfg.cell, s_zone.cfg.cell_thresh, s_zone.cfg.min_hot_cells);
+        }
+
+        zone_result_t r = zone_motion_update(&s_zone, fb->buf, w);
+        const int64_t now_ms = esp_timer_get_time() / 1000;
+        const int64_t since_ms = now_ms - last_capture_ms;
+
+        bool shoot = false;
+        const char *why = NULL;
+        if (r.trigger && since_ms >= REFRACTORY_MS) {
+            shoot = true;
+            why = "motion";
+        } else if (HEARTBEAT_MS > 0 && since_ms >= HEARTBEAT_MS) {
+            shoot = true;
+            why = "heartbeat";
+        }
+
+        if (shoot) {
+            upload_probe(fb, &r);
+            esp_camera_fb_return(fb);
+            fb = NULL;
+            capture_photo(why, &r);
+            last_capture_ms = esp_timer_get_time() / 1000;
+            captures++;
+        } else {
+            if (s_zone.frames % LOG_EVERY_FRAMES == 0) {
+                ESP_LOGI(TAG, "probing: frames=%u captures=%u last hot=%d global=%d",
+                         (unsigned)s_zone.frames, captures, r.hot_cells, r.global_mean);
+            }
+            esp_camera_fb_return(fb);
+        }
+        vTaskDelay(pdMS_TO_TICKS(PROBE_INTERVAL_MS));
     }
 }
