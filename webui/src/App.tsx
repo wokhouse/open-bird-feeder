@@ -54,7 +54,7 @@ export default function App() {
     setClassifying(true)
     setError(null)
     try {
-      const res = await classifyPending(10)
+      const res = await classifyPending(100)
       if (res.failed > 0) {
         setError(
           `classified ${res.classified}, failed ${res.failed}: ${res.error ?? 'AI call failed'}`,

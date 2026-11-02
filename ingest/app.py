@@ -372,7 +372,7 @@ async def classify(request: Request):
 
 @app.post("/api/classify_pending")
 async def classify_pending(request: Request):
-    """AI over up to 50 unclassified frames. Runs JEV_CONCURRENCY (default 4)
+    """AI over up to 100 unclassified frames. Runs JEV_CONCURRENCY (default 4)
     calls at a time: one jev.classify is two sequential HTTP round-trips of up
     to 60 s each, so a serial batch looks dead from the browser. A failed
     image is counted and the rest of the batch proceeds - one upstream 502
@@ -381,7 +381,7 @@ async def classify_pending(request: Request):
         body = await request.json()
     except Exception:
         body = {}
-    limit = max(1, min(int(body.get("limit", 10)), 50))
+    limit = max(1, min(int(body.get("limit", 10)), 100))
     unclassified = [r["path"] for r in rows() if r["state"] == "unclassified"]
     batch = unclassified[:limit]
     sem = asyncio.Semaphore(AI_CONCURRENCY)
