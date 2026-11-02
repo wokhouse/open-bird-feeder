@@ -25,6 +25,10 @@ at read time — so the review UI and firmware need no changes.
 migrate_v2() rewrites a v1 `classifications` table at startup and keeps the
 original as `classifications_v1` for audit.
 
+A verdict that flips a frame to bird_identified also publishes an ntfy push
+(notify.py, NTFY_TOPIC in .env): deduped per frame, tap opens the full photo
+over the tailnet.
+
 Endpoints:
   POST /upload?kind=photo|probe      raw JPEG body; headers: X-Device-Id,
                                      X-Motion-Hot, X-Motion-Global and
@@ -53,6 +57,7 @@ import sqlite3
 from pathlib import Path
 
 import jev
+import notify
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import PlainTextResponse
@@ -302,12 +307,34 @@ def auto_classify(rel: str) -> None:
         print(f"[auto] {rel}: AI FAILED: {e}")
 
 
+def effective_is_bird(conn, cid: int) -> bool:
+    """Current bird/no-bird reading of a capture, same precedence as rows():
+    human label wins, else the newest verdict. Used only to dedupe ntfy
+    pushes — re-classifying an already-bird frame must not notify again."""
+    h = conn.execute("SELECT state FROM human_label WHERE capture_id=?", (cid,)).fetchone()
+    if h:
+        return h["state"] in ("bird_identified", "species_identified")
+    v = conn.execute(
+        "SELECT p_bird, state_hint FROM verdict WHERE capture_id=? "
+        "ORDER BY id DESC LIMIT 1", (cid,)).fetchone()
+    if not v:
+        return False
+    if v["p_bird"] is not None:
+        return v["p_bird"] >= jev.BIRD_P
+    return v["state_hint"] == "bird_identified"  # pre-Jev verdict, kept verbatim
+
+
 def apply_verdict(rel: str, v: dict) -> str:
     """Append an AI verdict. Verdicts are append-only history and human labels
     live in their own table, so a re-run can never destroy manual work and
-    every model's probability stays on file for calibration and comparison."""
+    every model's probability stays on file for calibration and comparison.
+
+    A verdict that flips the capture's effective state to bird_identified
+    (not already bird before the insert) also pushes an ntfy alert
+    (notify.py); failed pushes are logged and dropped inside notify."""
     with db() as conn:
         cid = ensure_capture(conn, rel)
+        was_bird = effective_is_bird(conn, cid)
         conn.execute(
             "INSERT INTO verdict(capture_id,model,p_bird,box,note,cost_usd,latency_ms,ts) "
             "VALUES(?,?,?,?,?,?,?,?)",
@@ -315,7 +342,10 @@ def apply_verdict(rel: str, v: dict) -> str:
              json.dumps(v["box"]) if v.get("box") else None, v.get("note"),
              v.get("cost_usd"), v.get("latency_ms"), now()))
         h = conn.execute("SELECT state FROM human_label WHERE capture_id=?", (cid,)).fetchone()
-    return h["state"] if h else ("bird_identified" if v["bird"] else "no_bird")
+    state = h["state"] if h else ("bird_identified" if v["bird"] else "no_bird")
+    if state == "bird_identified" and not was_bird:
+        notify.bird_detected(rel, v)
+    return state
 
 
 @app.post("/api/delete_photo")

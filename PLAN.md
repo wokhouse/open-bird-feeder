@@ -233,6 +233,29 @@ JEV_BIRD_P, default threshold P(bird) >= 0.5).
    bird). Picture-of-a-bird ≠ real bird is the production-correct reading
    under the current criteria; liquid/d1.1 fails this case — deprioritized.
 
+6e. **ntfy bird alerts** — DONE + verified 2026-11-02: ingest/notify.py pushes
+   to ntfy when a verdict FLIPS a capture's effective state to
+   bird_identified — dedupe via effective_is_bird() checked before the verdict
+   insert (human_label wins, else newest verdict), so re-classifying an
+   already-bird frame pushes nothing (measured: re-POST /api/classify, pushes
+   4→4). Wiring is inside apply_verdict, so /upload auto-classify,
+   /api/classify and classify_pending are all covered by one hook. Message:
+   JSON-body publish (POST {server}/, topic in body — sidesteps header
+   encoding entirely), title "🐦 Bird at the feeder", body = HH:MM + p_bird +
+   model, priority 3, tags [bird], click = the frame's /files/ URL on
+   http://sleepy.tail643d2.ts.net:8077 (INGEST_PUBLIC_URL). No inline image:
+   ntfy.sh's nginx 414s query-string base64 above ~5 KB (measured: 4985-byte
+   URI 200, 9699-byte 414; a 160px preview of a real frame is already at the
+   edge), and the Attach header would make ntfy.sh itself fetch the
+   tailnet-only URL. End-to-end on a test server (:18077, real DATA/DB):
+   Commons sparrow JPEG → /upload → verdict p=0.994 → push seen via
+   poll API; test frames deleted after (total back to device-only count).
+   Config: NTFY_TOPIC in ingest/.env (unset = feature off), NTFY_SERVER
+   default ntfy.sh. Pitfall hit: writing the topic by hand into .env mangled
+   the UUID into "729e9f…5a53" (an actual … byte, len<36) → ntfy
+   400 "topic invalid"; assemble long hex from fragments in shell, and check
+   ${#VAR} for length before trusting a written identifier.
+
 Decision at end of Phase 3 (alt): stream probes to Pi for a real detector instead
 of on-device model — pipeline is the same either way.
 
