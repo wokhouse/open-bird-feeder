@@ -102,7 +102,12 @@ JEV_BIRD_P, default threshold P(bird) >= 0.5).
    from stopping the stream, not from slower polling.
    Ladder (capture quality first):
    1. Wi-Fi dial-before-call: connect only to upload. ~0.2-0.3 W saved, zero
-      capture cost. Firmware change, safe.
+      capture cost. IMPLEMENTED 2026-11-01 (d4bd059): radio off while probing,
+      dialed per capture cycle; on connect failure the capture is skipped (no
+      camera mode switch for an un-uploadable photo), retries rate-limited by
+      the refractory window, stale reference frame reset (skips= counter in
+      logs). Build verified on bingbong (bin 0.96 MB, 68% app partition free).
+      FLASH + bank-gauge measurement pending — no board attached.
    2. PIR wake + deep sleep (the trail-cam architecture): deep-sleep until the
       PIR fires, then run the existing probe+capture loop, idle-timeout back to
       sleep. Weeks per bank. Two hardware catches: the PIR must see the tray
