@@ -88,15 +88,44 @@ static void add_noise(uint8_t *f, int span)
 
 static int s_fail;
 
-static void check(const char *name, zone_result_t r, int want_motion, int want_trigger)
+static zone_motion_t s_zone;
+
+static int bits_in_range(const zone_result_t *r, int cx0, int cx1, int cy0, int cy1)
 {
-    const int ok = (!!r.motion == !!want_motion) && (!!r.trigger == !!want_trigger);
-    if (!ok) s_fail++;
-    printf("%-28s hot=%3d global=%3d motion=%d trigger=%d  %s\n",
-           name, r.hot_cells, r.global_mean, r.motion, r.trigger, ok ? "ok" : "FAIL");
+    /* +N: N hot bits, all inside the box. -N: N hot bits, some outside. 0: none. */
+    const int cols = s_zone.cols, rows = s_zone.rows;
+    int inside = 0, outside = 0;
+    for (int cy = 0; cy < rows; cy++) {
+        for (int cx = 0; cx < cols; cx++) {
+            const int i = cy * cols + cx;
+            if (!(r->hot_bits[i >> 3] & (1u << (i & 7)))) continue;
+            if (cx >= cx0 && cx <= cx1 && cy >= cy0 && cy <= cy1) inside++;
+            else outside++;
+        }
+    }
+    return outside ? -inside : inside;
 }
 
-static zone_motion_t s_zone;
+static int count_hot_bits(const zone_result_t *r)
+{
+    int bits = 0;
+    if (!r->hot_bits) return -1;
+    for (int i = 0; i < s_zone.hot_bytes; i++)
+        bits += __builtin_popcount(r->hot_bits[i]);
+    return bits;
+}
+
+static void check(const char *name, zone_result_t r, int want_motion, int want_trigger)
+{
+    /* The mask must agree with the count, always: it is what gets uploaded
+     * as the X-Motion-Grid and lands in the server-side sidecar. */
+    const int bits = count_hot_bits(&r);
+    const int ok = (!!r.motion == !!want_motion) && (!!r.trigger == !!want_trigger) &&
+                   bits == r.hot_cells;
+    if (!ok) s_fail++;
+    printf("%-28s hot=%3d bits=%3d global=%3d motion=%d trigger=%d  %s\n",
+           name, r.hot_cells, bits, r.global_mean, r.motion, r.trigger, ok ? "ok" : "FAIL");
+}
 
 static zone_result_t step(const uint8_t *f)
 {
@@ -136,6 +165,16 @@ static void synthetic_tests(void)
     add_blob(cur, 80, 96, 9, 6, -55);
     r = step(cur);
     check("bird in zone (frame 1)", r, 1, 0);
+    /* The mask must localize the bird: blob spans px x71..89 y90..102 ->
+     * exactly cells x17..22 y4..7 can be hot (everything past that has zero
+     * overlap with the blob, so it can never heat up). Center cell must fire. */
+    const int in_box = bits_in_range(&r, 17, 22, 4, 7);
+    const int ci = 5 * s_zone.cols + 20;
+    const int center = (r.hot_bits[ci >> 3] >> (ci & 7)) & 1;
+    const int mask_ok = in_box > 0 && center;
+    if (!mask_ok) s_fail++;
+    printf("%-28s hot bits in bird box=%3d center cell set=%d  %s\n",
+           "hot mask localizes bird", in_box, center, mask_ok ? "ok" : "FAIL");
     add_blob(cur, 84, 98, 9, 6, -55); /* keeps moving */
     check("bird in zone (frame 2)", step(cur), 1, 1);
 

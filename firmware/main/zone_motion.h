@@ -29,6 +29,11 @@ typedef struct {
     int motion;      /* this frame counted as motion */
     int consec;      /* consecutive motion frames so far */
     int trigger;     /* 1 on the frame that fires a capture */
+    /* Which cells were hot, for the last diffed frame: bit (cy*cols+cx),
+     * low bit first inside each byte, grid dims at z->cols / z->rows.
+     * Points into z->hot_bits and stays valid until the next
+     * zone_motion_update() call. NULL until the first diffed frame. */
+    const uint8_t *hot_bits;
 } zone_result_t;
 
 typedef struct {
@@ -38,6 +43,8 @@ typedef struct {
     int zw, zh;    /* zone size in pixels */
     uint8_t *prev; /* zone pixels of the previous frame, zw*zh */
     uint32_t *cell_sum;
+    uint8_t *hot_bits; /* packed hot-cell grid, hot_bytes = (cols*rows+7)/8 */
+    int hot_bytes;
     int primed;
     int consec;
     uint32_t frames, triggers;

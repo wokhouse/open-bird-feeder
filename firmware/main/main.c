@@ -68,6 +68,10 @@ static const char *TAG = "birdcam";
 #define HEARTBEAT_MS  900000 /* 15 min: one photo when nothing moves (0 = off) */
 #define LOG_EVERY_FRAMES 400 /* one info line per ~60 s of probing */
 
+/* Cap on the hex-encoded hot-cell bitmap we put in the X-Motion-Grid header
+ * (150 bytes = 1200 cells; today's grid is 480). Over-cap = no header. */
+#define GRID_HEX_MAX_BYTES 150
+
 #define WIFI_CONNECTED_BIT BIT0
 
 static EventGroupHandle_t s_wifi_events;
@@ -169,9 +173,11 @@ static void wifi_connect_blocking(void)
 }
 
 /* POST a buffer to the ingest service. hot/global < 0 = no motion headers.
+ * grid non-NULL = also send it as X-Motion-Grid (probe frames only).
  * Returns true on HTTP 200. */
 static bool upload_bytes(const uint8_t *buf, size_t len, const char *kind,
-                         const char *content_type, int hot, int global)
+                         const char *content_type, int hot, int global,
+                         const char *grid)
 {
     char url[128];
     snprintf(url, sizeof(url), "%s/upload?kind=%s", INGEST_BASE, kind);
@@ -195,6 +201,7 @@ static bool upload_bytes(const uint8_t *buf, size_t len, const char *kind,
         snprintf(num, sizeof(num), "%d", global);
         esp_http_client_set_header(client, "X-Motion-Global", num);
     }
+    if (grid) esp_http_client_set_header(client, "X-Motion-Grid", grid);
     esp_http_client_set_post_field(client, (const char *)buf, len);
 
     bool ok = false;
@@ -209,17 +216,73 @@ static bool upload_bytes(const uint8_t *buf, size_t len, const char *kind,
     return ok;
 }
 
+/* Draw 1px white outlines on the hot cells of a grayscale probe fb, so the
+ * uploaded tuning frame shows what fired without needing the sidecar. */
+static void draw_hot_cells(camera_fb_t *fb, const zone_result_t *r)
+{
+    if (!r->hot_bits) return;
+    const int cell = s_zone.cfg.cell;
+    const int cols = s_zone.cols, rows = s_zone.rows;
+    for (int cy = 0; cy < rows; cy++) {
+        for (int cx = 0; cx < cols; cx++) {
+            const int i = cy * cols + cx;
+            if (!(r->hot_bits[i >> 3] & (1u << (i & 7)))) continue;
+            int x0 = s_zone.cfg.x0 + cx * cell, y0 = s_zone.cfg.y0 + cy * cell;
+            int x1 = s_zone.cfg.x0 + (cx + 1) * cell - 1;
+            int y1 = s_zone.cfg.y0 + (cy + 1) * cell - 1;
+            if (x1 >= fb->width)  x1 = fb->width - 1;
+            if (y1 >= fb->height) y1 = fb->height - 1;
+            for (int x = x0; x <= x1; x++) {
+                fb->buf[(size_t)y0 * fb->width + x] = 255;
+                fb->buf[(size_t)y1 * fb->width + x] = 255;
+            }
+            for (int y = y0; y <= y1; y++) {
+                fb->buf[(size_t)y * fb->width + x0] = 255;
+                fb->buf[(size_t)y * fb->width + x1] = 255;
+            }
+        }
+    }
+}
+
+/* X-Motion-Grid value: packed hot-cell bitmap (hex) plus the mapping the
+ * server needs to turn probe pixels into boxes later (non-LLM recognizers)
+ * without re-running the detector. "" when the grid is too big to carry. */
+static void build_grid_json(char *out, size_t outsz)
+{
+    static const char hx[16] = "0123456789abcdef";
+    const uint8_t *b = s_zone.hot_bits;
+    const int nb = s_zone.hot_bytes;
+    char hex[2 * GRID_HEX_MAX_BYTES + 1];
+    out[0] = '\0';
+    if (!b || nb > GRID_HEX_MAX_BYTES) return;
+    for (int i = 0; i < nb; i++) {
+        hex[2 * i] = hx[b[i] >> 4];
+        hex[2 * i + 1] = hx[b[i] & 15];
+    }
+    hex[2 * nb] = '\0';
+    snprintf(out, outsz,
+             "{\"gw\":%d,\"gh\":%d,\"cell\":%d,\"zone\":[%d,%d,%d,%d],"
+             "\"frame\":[%d,%d],\"bits\":\"%s\"}",
+             s_zone.cols, s_zone.rows, s_zone.cfg.cell,
+             s_zone.cfg.x0, s_zone.cfg.y0, s_zone.cfg.x1, s_zone.cfg.y1,
+             s_zone.w, s_zone.h, hex);
+}
+
 /* Upload the grayscale probe frame that triggered a capture, as small JPEG.
  * Lets us see what the detector saw and retune the zone from real data. */
 static void upload_probe(const camera_fb_t *fb, const zone_result_t *r)
 {
     uint8_t *jpg = NULL;
     size_t jpg_len = 0;
+    draw_hot_cells((camera_fb_t *)fb, r); /* box the trigger onto the frame */
+    char grid[512];
+    build_grid_json(grid, sizeof(grid));
     if (!frame2jpg((camera_fb_t *)fb, PROBE_JPEG_QUALITY, &jpg, &jpg_len)) {
         ESP_LOGW(TAG, "probe encode failed");
         return;
     }
-    bool ok = upload_bytes(jpg, jpg_len, "probe", "image/jpeg", r->hot_cells, r->global_mean);
+    bool ok = upload_bytes(jpg, jpg_len, "probe", "image/jpeg", r->hot_cells,
+                           r->global_mean, grid[0] ? grid : NULL);
     ESP_LOGI(TAG, "probe %ux%u %u B -> %s (hot=%d global=%d)", fb->width, fb->height,
              (unsigned)jpg_len, ok ? "OK" : "FAIL", r->hot_cells, r->global_mean);
     free(jpg);
@@ -245,7 +308,7 @@ static bool capture_photo(const char *why, const zone_result_t *r)
     camera_fb_t *fb = esp_camera_fb_get();
     bool ok = false;
     if (fb) {
-        ok = upload_bytes(fb->buf, fb->len, "photo", "image/jpeg", -1, -1);
+        ok = upload_bytes(fb->buf, fb->len, "photo", "image/jpeg", -1, -1, NULL);
         ESP_LOGI(TAG, "%s photo: %u bytes -> %s (hot=%d global=%d)", why, (unsigned)fb->len,
                  ok ? "OK" : "FAIL", r->hot_cells, r->global_mean);
         esp_camera_fb_return(fb);

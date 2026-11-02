@@ -31,9 +31,11 @@ int zone_motion_init(zone_motion_t *z, int w, int h, const zone_cfg_t *cfg)
     z->cols = (z->zw + z->cfg.cell - 1) / z->cfg.cell;
     z->rows = (z->zh + z->cfg.cell - 1) / z->cfg.cell;
 
+    z->hot_bytes = (z->cols * z->rows + 7) / 8;
     z->prev = malloc((size_t)z->zw * (size_t)z->zh);
     z->cell_sum = calloc((size_t)z->cols * (size_t)z->rows, sizeof(uint32_t));
-    if (!z->prev || !z->cell_sum) {
+    z->hot_bits = calloc((size_t)z->hot_bytes, 1);
+    if (!z->prev || !z->cell_sum || !z->hot_bits) {
         zone_motion_free(z);
         return -1;
     }
@@ -52,8 +54,10 @@ void zone_motion_free(zone_motion_t *z)
     if (!z) return;
     free(z->prev);
     free(z->cell_sum);
+    free(z->hot_bits);
     z->prev = NULL;
     z->cell_sum = NULL;
+    z->hot_bits = NULL;
 }
 
 static void copy_zone_in(zone_motion_t *z, const uint8_t *frame, int stride)
@@ -98,15 +102,23 @@ zone_result_t zone_motion_update(zone_motion_t *z, const uint8_t *frame, int str
     r.global_mean = (int)(total / (uint32_t)zone_px);
     const int bias = z->cfg.light_reject ? r.global_mean : 0;
 
-    /* Pass 2: cells whose mean |diff| beats the threshold count as hot. */
+    /* Pass 2: cells whose mean |diff| beats the threshold count as hot.
+     * Record which ones: the caller uploads the grid as a sidecar signal for
+     * later non-LLM recognizers (and boxes it onto the probe frame). */
+    memset(z->hot_bits, 0, (size_t)z->hot_bytes);
     for (int cy = 0; cy < z->rows; cy++) {
         const int ph = (cy + 1 == z->rows) ? z->zh - cy * cell : cell;
         for (int cx = 0; cx < cols; cx++) {
             const int pw = (cx + 1 == cols) ? z->zw - cx * cell : cell;
             const int mean = (int)(z->cell_sum[(size_t)cy * cols + cx] / (uint32_t)(pw * ph));
-            if (mean - bias >= z->cfg.cell_thresh) r.hot_cells++;
+            if (mean - bias >= z->cfg.cell_thresh) {
+                const int i = cy * cols + cx;
+                z->hot_bits[i >> 3] |= (uint8_t)(1u << (i & 7));
+                r.hot_cells++;
+            }
         }
     }
+    r.hot_bits = z->hot_bits;
 
     r.motion = r.hot_cells >= z->cfg.min_hot_cells;
     z->consec = r.motion ? z->consec + 1 : 0;

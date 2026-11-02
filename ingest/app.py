@@ -9,7 +9,10 @@ AI re-runs replace the row either way in v0;
 manual-vs-AI precedence is a hardening TODO in PLAN.md).
 
 Endpoints:
-  POST /upload?kind=photo|probe      raw JPEG body; headers: X-Device-Id
+  POST /upload?kind=photo|probe      raw JPEG body; headers: X-Device-Id,
+                                     X-Motion-Hot, X-Motion-Global and
+                                     X-Motion-Grid (probe: packed hot-cell
+                                     map; stored as a .grid.json sidecar)
   GET  /api/images                   [{path,state,species,source,confidence,note}]
   GET  /api/stats                    counts per state
   POST /api/set_state {path,state,species?}   manual review ('unclassified' clears)
@@ -23,6 +26,7 @@ Run:  ./run.sh   (venv + uvicorn on 0.0.0.0:$PORT default 8078; reads ingest/.en
 import csv
 import datetime
 import io
+import json
 import os
 import sqlite3
 from pathlib import Path
@@ -107,6 +111,30 @@ def rows() -> list[dict]:
     return out
 
 
+def save_motion_grid(path: Path, headers) -> None:
+    """Decode the X-Motion-Grid header (packed hot-cell bitmap + zone mapping)
+    into a .grid.json sidecar beside the probe frame. Later non-LLM recognizers
+    can derive bounding boxes without re-running the detector. A missing or
+    malformed header (older firmware) is skipped silently."""
+    try:
+        g = json.loads(headers.get("x-motion-grid") or "")
+        gw, gh, cell = int(g["gw"]), int(g["gh"]), int(g["cell"])
+        zone, frame = [int(v) for v in g["zone"]], [int(v) for v in g["frame"]]
+        bits = bytes.fromhex(g["bits"])
+        hot = int(headers.get("x-motion-hot", "-1"))
+        glob = int(headers.get("x-motion-global", "-1"))
+    except (ValueError, KeyError, TypeError):
+        return
+    if cell < 1 or gw < 1 or gh < 1 or len(bits) < (gw * gh + 7) // 8:
+        return
+    cells = [[i % gw, i // gw] for i in range(gw * gh) if bits[i >> 3] >> (i & 7) & 1]
+    sidecar = path.with_name(path.stem + ".grid.json")
+    sidecar.write_text(json.dumps({
+        "frame_wh": frame, "zone": zone, "cell": cell, "grid_wh": [gw, gh],
+        "hot": hot, "global": glob, "cells": cells,
+    }))
+
+
 @app.post("/upload")
 async def upload(request: Request, kind: str = "photo"):
     if kind not in ("photo", "probe"):
@@ -124,6 +152,8 @@ async def upload(request: Request, kind: str = "photo"):
         path = folder / f"{ts.strftime('%H%M%S')}_{device}_{n}.jpg"
         n += 1
     path.write_bytes(body)
+    if kind == "probe":
+        save_motion_grid(path, request.headers)
     return {"ok": True, "path": str(path.relative_to(DATA)), "bytes": len(body)}
 
 
