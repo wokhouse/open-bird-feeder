@@ -5,4 +5,5 @@ data/
 webui/node_modules/
 webui/dist/
 .DS_Store
-ingest/labels.db
+# runtime databases (the live service writes these)
+*.db
