@@ -1,5 +1,5 @@
-import { useState } from 'react'
-import { Ban, Bird, RotateCcw, Sparkles, Tag } from 'lucide-react'
+import { useEffect, useState } from 'react'
+import { Ban, Bird, RotateCcw, Sparkles, Tag, Trash2 } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import {
@@ -10,7 +10,7 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
-import { classifyWithAI, setState, type Img, type State } from '@/lib/api'
+import { classifyWithAI, deletePhoto, setState, type Img, type State } from '@/lib/api'
 
 export function stateBadge(img: Img) {
   switch (img.state) {
@@ -44,6 +44,13 @@ export default function FrameCard({
   const [busy, setBusy] = useState(false)
   const [speciesOpen, setSpeciesOpen] = useState(false)
   const [species, setSpecies] = useState(img.species ?? '')
+  const [armedDelete, setArmedDelete] = useState(false)
+
+  useEffect(() => {
+    if (!armedDelete) return
+    const t = setTimeout(() => setArmedDelete(false), 3000) // disarm on pause, so a stray second click never deletes
+    return () => clearTimeout(t)
+  }, [armedDelete])
 
   const act = async (fn: () => Promise<unknown>) => {
     setBusy(true)
@@ -124,6 +131,26 @@ export default function FrameCard({
               <RotateCcw className="size-3.5" />
             </Button>
           )}
+          <Button
+            size="sm"
+            variant={armedDelete ? 'destructive' : 'ghost'}
+            className="ml-auto px-2"
+            disabled={busy}
+            onClick={() => {
+              if (!armedDelete) {
+                setArmedDelete(true)
+                return
+              }
+              act(async () => {
+                await deletePhoto(img.path)
+                setArmedDelete(false)
+              })
+            }}
+            title={armedDelete ? 'Click again to delete this photo for good' : 'Delete photo (file and all labels)'}
+            aria-label={armedDelete ? 'Confirm delete photo' : 'Delete photo'}
+          >
+            <Trash2 className="size-3.5" />
+          </Button>
         </div>
         <p className="truncate text-[10px] text-muted-foreground" title={img.path}>
           {img.path}

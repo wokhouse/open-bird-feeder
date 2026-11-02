@@ -34,6 +34,7 @@ Endpoints:
   GET  /api/images                   [{path,state,species,source,confidence,note,box}]
   GET  /api/stats                    counts per state
   POST /api/set_state {path,state,species?}   manual review ('unclassified' clears)
+  POST /api/delete_photo {path}               delete file + all its rows for good
   POST /api/classify {path}          re-run AI on one frame, stores result
   POST /api/classify_pending {limit} AI over up to N unclassified frames (backfill)
   GET  /export.csv                   path,state,species,source,confidence,note,box
@@ -297,6 +298,27 @@ def apply_verdict(rel: str, v: dict) -> str:
              v.get("cost_usd"), v.get("latency_ms"), now()))
         h = conn.execute("SELECT state FROM human_label WHERE capture_id=?", (cid,)).fetchone()
     return h["state"] if h else ("bird_identified" if v["bird"] else "no_bird")
+
+
+@app.post("/api/delete_photo")
+async def delete_photo(request: Request):
+    """Delete a stored image for good: the file, its .grid.json sidecar, and
+    every metadata row (human_label, all verdicts, the capture). Distinct from
+    set_state unclassified, which keeps the photo and clears only its labels."""
+    body = await request.json()
+    rel = safe_relpath(str(body.get("path", "")))
+    path = DATA / rel
+    sidecar = path.with_name(path.stem + ".grid.json")
+    if sidecar.is_file():
+        sidecar.unlink()
+    path.unlink()
+    with db() as conn:
+        cid = conn.execute("SELECT id FROM capture WHERE path=?", (rel,)).fetchone()
+        if cid:
+            conn.execute("DELETE FROM human_label WHERE capture_id=?", (cid["id"],))
+            conn.execute("DELETE FROM verdict WHERE capture_id=?", (cid["id"],))
+            conn.execute("DELETE FROM capture WHERE id=?", (cid["id"],))
+    return {"ok": True, "path": rel}
 
 
 @app.post("/api/set_state")
