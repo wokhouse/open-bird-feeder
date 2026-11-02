@@ -75,6 +75,14 @@ export default function FrameCard({
           loading="lazy"
           className="aspect-[4/3] w-full rounded-t-lg object-cover"
         />
+        {img.taken_at && (
+          <span
+            title={`captured ${img.taken_at}`}
+            className="absolute left-1 top-1 rounded bg-black/60 px-1.5 py-0.5 text-[10px] font-medium tabular-nums text-white"
+          >
+            {img.taken_at.replace('T', ' ')}
+          </span>
+        )}
         {img.box && (
           <div
             title="AI bird location"

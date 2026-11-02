@@ -12,6 +12,7 @@ export interface Img {
   confidence: number | null
   note: string | null
   box: [number, number, number, number] | null // AI bbox, normalized 0..1 [x1,y1,x2,y2]
+  taken_at: string | null // server-local wall clock, e.g. 2026-11-01T19:27:45
 }
 
 export interface Stats {

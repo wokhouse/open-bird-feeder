@@ -31,7 +31,7 @@ Endpoints:
                                      X-Motion-Grid (probe: packed hot-cell
                                      map; stored as a .grid.json sidecar).
                                      kind=photo also queues AI review.
-  GET  /api/images                   [{path,state,species,source,confidence,note,box}]
+  GET  /api/images                   [{path,state,species,source,confidence,note,box,taken_at}]
   GET  /api/stats                    counts per state
   POST /api/set_state {path,state,species?}   manual review ('unclassified' clears)
   POST /api/delete_photo {path}               delete file + all its rows for good
@@ -184,20 +184,32 @@ def rows() -> list[dict]:
     unclassified. Because raw probabilities are stored, retuning JEV_BIRD_P
     re-labels all history with zero API calls."""
     conn = db()
-    caps = {r["path"]: r["id"] for r in conn.execute("SELECT id, path FROM capture")}
+    caps = {r["path"]: r for r in conn.execute(
+        "SELECT id, path, taken_at FROM capture")}
+
+    def ts_of(cap, rel):  # capture row first; the filename is the fallback
+        if cap and cap["taken_at"]:
+            return cap["taken_at"]
+        m = CAP_PARSE.match(rel)
+        if m:
+            return f"{m.group(2)}T{m.group(3)[:2]}:{m.group(3)[2:4]}:{m.group(3)[4:6]}"
+        return None
+
     humans = {r["capture_id"]: dict(r) for r in conn.execute("SELECT * FROM human_label")}
     latest = {r["capture_id"]: dict(r) for r in conn.execute(
         "SELECT * FROM verdict WHERE id IN "
         "(SELECT MAX(id) FROM verdict GROUP BY capture_id)")}
     out = []
     for p in list_images():
-        cid = caps.get(p)
+        cap = caps.get(p)
+        cid = cap["id"] if cap else None
+        taken = ts_of(cap, p)
         h = humans.get(cid) if cid is not None else None
         v = latest.get(cid) if cid is not None else None
         if h:
             out.append({"path": p, "state": h["state"], "species": h["species"],
                         "source": "manual", "confidence": None,
-                        "note": h["note"], "box": None})
+                        "note": h["note"], "box": None, "taken_at": taken})
         elif v:
             if v["p_bird"] is not None:
                 bird = v["p_bird"] >= jev.BIRD_P
@@ -208,10 +220,12 @@ def rows() -> list[dict]:
             out.append({"path": p, "state": "bird_identified" if bird else "no_bird",
                         "species": None, "source": "ai", "confidence": conf,
                         "note": v["note"],
-                        "box": json.loads(v["box"]) if v["box"] else None})
+                        "box": json.loads(v["box"]) if v["box"] else None,
+                        "taken_at": taken})
         else:
             out.append({"path": p, "state": "unclassified", "species": None,
-                        "source": None, "confidence": None, "note": None, "box": None})
+                        "source": None, "confidence": None, "note": None, "box": None,
+                        "taken_at": taken})
     return out
 
 
