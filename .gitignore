@@ -7,3 +7,4 @@ webui/dist/
 .DS_Store
 # runtime databases (the live service writes these)
 *.db
+.worktrees/
