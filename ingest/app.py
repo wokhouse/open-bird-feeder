@@ -1,4 +1,4 @@
-"""open-birdhouse ingest service (runs on the laptop in dev, the Pi in prod).
+"""open-bird-feeder ingest service (runs on the laptop in dev, the Pi in prod).
 
 Upload + AI classification + manual review for the bird training set.
 Every uploaded photo is auto-classified in the background by the Jev
@@ -68,7 +68,7 @@ STATES = ("no_bird", "bird_identified", "species_identified")
 # 2 sequential upstream HTTP requests, so 4 here = at most 8 open connections)
 AI_CONCURRENCY = max(1, int(os.environ.get("JEV_CONCURRENCY", "4")))
 
-app = FastAPI(title="open-birdhouse ingest")
+app = FastAPI(title="open-bird-feeder ingest")
 
 
 def db() -> sqlite3.Connection:
@@ -448,7 +448,7 @@ else:
     @app.get("/")
     def api_index():
         return {
-            "service": "open-birdhouse ingest",
+            "service": "open-bird-feeder ingest",
             "ui": "webui/dist not built — run the vite dev server (webui/)",
             "endpoints": ["/upload", "/api/images", "/api/stats", "/api/set_state",
                           "/api/classify", "/api/classify_pending", "/export.csv",

@@ -1,2 +1,2 @@
-# open-birdhouse
-open source birdhouse with camera and species classification
+# open-bird-feeder
+open source bird feeder with camera and species classification

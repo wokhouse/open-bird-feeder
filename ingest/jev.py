@@ -60,11 +60,11 @@ BIRD_CRITERIA = {
     "true": ("One or more real birds are present anywhere in a photo — perched "
              "on the house, at the entrance hole, in flight, blurred, or "
              "partially occluded. Feathers, beak, or wings count."),
-    "false": ("No bird in any photo — empty birdhouse, feeder, seeds, leaves, "
+    "false": ("No bird in any photo — empty feeder, seeds, leaves, "
               "branches, sky, insects, or other non-bird animals (squirrels)."),
 }
 
-SCENE = ("Frame from a fixed camera aimed at a birdhouse in a backyard; "
+SCENE = ("Frame from a fixed camera aimed at a bird feeder in a backyard; "
          "the photo follows. ")
 
 
@@ -112,7 +112,7 @@ def classify(jpeg: bytes) -> dict:
         questions["bird_box"] = {
             "type": "box",
             "instructions": "the most prominent real bird in the "
-                            "birdhouse camera photo",
+                            "bird feeder camera photo",
         }
     body = json.dumps({
         "model": MODEL,

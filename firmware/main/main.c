@@ -346,7 +346,7 @@ void app_main(void)
     uint8_t mac[6];
     esp_read_mac(mac, ESP_MAC_WIFI_STA);
     snprintf(s_device_id, sizeof(s_device_id), "xiao-%02x%02x%02x", mac[3], mac[4], mac[5]);
-    ESP_LOGI(TAG, "open-birdhouse cam %s starting", s_device_id);
+    ESP_LOGI(TAG, "open-bird-feeder cam %s starting", s_device_id);
 
     ESP_ERROR_CHECK(nvs_flash_init());
     wifi_connect_blocking();

@@ -1,7 +1,7 @@
 // Zone tuning knobs, shared by the firmware and the host test harness.
 //
 // Zone is in percent of the probe frame so it survives a resolution change.
-// Current feeder framing (open-birdhouse hero photo): the tray rim spans the
+// Current feeder framing (open-bird-feeder hero photo): the tray rim spans the
 // 65-78% band and the seed pile fills the bottom quarter, so the zone starts
 // just above the rim and runs to the bottom edge. If the camera gets rotated
 // or re-aimed, change these numbers and nothing else.

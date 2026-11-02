@@ -80,7 +80,7 @@ export default function App() {
     <div className="mx-auto max-w-7xl p-4 md:p-6">
       <header className="mb-4 flex flex-wrap items-center justify-between gap-3">
         <div>
-          <h1 className="text-lg font-semibold">open-birdhouse review</h1>
+          <h1 className="text-lg font-semibold">open-bird-feeder review</h1>
           <p className="text-sm text-muted-foreground">
             {stats
               ? `${stats.total} frames · ${stats.unclassified} awaiting AI/review`

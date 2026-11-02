@@ -1,4 +1,4 @@
-# Plan — open-birdhouse
+# Plan — open-bird-feeder
 
 XIAO ESP32S3 Sense (onboard camera, 8MB PSRAM) takes bird photos and POSTs
 them to an ingest service on the LAN (dev: this laptop, prod: a Pi).
@@ -89,7 +89,7 @@ JEV_BIRD_P, default threshold P(bird) >= 0.5).
    scene (negatives = the actual background), flash int8 model, probe loop
    replaced by the classifier, debounce + burst capture on bird edges.
 6. **Pi deployment** — DONE 2026-11-01 (service part): ingest runs on sleepy (Pi, Debian 13)
-   as systemd unit birdhouse-ingest.service — repo at /home/fungj/repos/open-birdhouse
+   as systemd unit open-bird-feeder-ingest.service — repo at /home/fungj/repos/open-bird-feeder
    (pull from GitHub main), venv, uvicorn on 0.0.0.0:8077, Restart=on-failure. ingest/.env
    sets LLM_BASE_URL=http://100.73.247.126:8080/v1 (bingbong over its Tailscale IP —
    bingbong.local does not resolve from the Pi) + the API key. NOTE superseded by phase 6b:
@@ -126,7 +126,7 @@ JEV_BIRD_P, default threshold P(bird) >= 0.5).
    rejected boxes traced as box=rejected; stale LLM_API_KEY hints removed
    (webui banner, run.sh). DEPLOY: prod ingest/.env now carries
    OPENROUTER_API_KEY (~/.hermes/.env key updated too; the old one 401s),
-   merge jev -> main, restart birdhouse-ingest. Tune JEV_BIRD_P once real bird
+   merge jev -> main, restart open-bird-feeder-ingest. Tune JEV_BIRD_P once real bird
    captures exist (all 327 live labels are no_bird, so no positive calibration
    yet).
 6c. **Storage schema v2: captures / verdicts / human labels split** — code DONE +
@@ -147,7 +147,7 @@ JEV_BIRD_P, default threshold P(bird) >= 0.5).
    CSV export and firmware are untouched. migrate_v2() rewrites at startup
    (328 rows -> 328 capture + 274 verdict + 54 human_label) and keeps the old
    table as classifications_v1. set_state unclassified now clears both label
-   and verdict history. Deploy: restart birdhouse-ingest (migration runs on
+   and verdict history. Deploy: restart open-bird-feeder-ingest (migration runs on
    boot); back up labels.db first.
 
 Decision at end of Phase 3 (alt): stream probes to Pi for a real detector instead
