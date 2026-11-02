@@ -81,7 +81,17 @@ wins locally. Needs LLM_API_KEY in ingest/.env.
 5b. **On-device gating (classifier)** — train bird/no-bird on the real mounting
    scene (negatives = the actual background), flash int8 model, probe loop
    replaced by the classifier, debounce + burst capture on bird edges.
-6. **Pi deployment** — same ingest service on the Pi, point device at it. Hardening: retries, buffers.
+6. **Pi deployment** — DONE 2026-11-01 (service part): ingest runs on sleepy (Pi, Debian 13)
+   as systemd unit birdhouse-ingest.service — repo at /home/fungj/repos/open-birdhouse
+   (pull from GitHub main), venv, uvicorn on 0.0.0.0:8077, Restart=on-failure. ingest/.env
+   sets LLM_BASE_URL=http://100.73.247.126:8080/v1 (bingbong over its Tailscale IP —
+   bingbong.local does not resolve from the Pi) + the API key. Data + labels.db migrated
+   from the laptop; laptop service stopped, :8077 there is free. Device INGEST_BASE =
+   http://192.168.1.217:8077 (secrets.h, reflashed; device now at 192.168.1.123 via DHCP).
+   Web UI: http://sleepy.tail643d2.ts.net:8077 (tailnet/MagicDNS) or sleepy.local:8077 (LAN).
+   Pitfall fixed during test: uploads must be the raw JPEG request body — `curl -F` sends
+   multipart and the whole envelope gets stored verbatim (corrupt file, classifier 400).
+   Hardening: retries, buffers — open.
 
 Decision at end of Phase 3 (alt): stream probes to Pi for a real detector instead
 of on-device model — pipeline is the same either way.
