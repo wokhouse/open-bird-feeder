@@ -110,6 +110,18 @@ JEV_BIRD_P, default threshold P(bird) >= 0.5).
       streak, cap 128 s); stale reference frame reset (skips= counter in
       logs). Review-clean build on bingbong (bin 0.96 MB, 68% app partition
       free). FLASH + bank-gauge measurement pending — flashing in the am.
+      STATUS 2026-11-02: flashed and running from a 5000 mAh battery (device
+      xiao-1e85fc uploading since 09:43). Capture activity measured from
+      labels.db: 24 photo+probe pairs in 28.9 min = ~50 photos/hour (gate
+      fires often; likely moving leaves). Runtime ESTIMATE, not measured:
+      5000 mAh = 18.5 Wh, ~16 Wh usable through the 5V path; probe-mode draw
+      with Wi-Fi off between captures ≈ 1.0-1.4 W (pre-5c 1.3-1.7 W minus the
+      0.2-0.3 W Wi-Fi saving) → ~11-16 h, i.e. half a day. Capture rate is
+      noise in that number (see key fact above); 5000 mAh is structurally too
+      small for multi-day operation on this architecture — PIR + deep sleep
+      (step 2) is the fix. Bank low-load auto-off will NOT trip here
+      (~200 mA at 5V >> the ~50 mA cutoff). MEASURE: note bank % now, again
+      after N hours, draw_W = bank_Wh x pct/100 / N.
    2. PIR wake + deep sleep (the trail-cam architecture): deep-sleep until the
       PIR fires, then run the existing probe+capture loop, idle-timeout back to
       sleep. Weeks per bank. Two hardware catches: the PIR must see the tray
