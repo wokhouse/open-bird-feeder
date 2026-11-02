@@ -17,10 +17,14 @@ Receiver (FastAPI): stores uploads under data/<kind>/<date>/HHMMSS_<device>.jpg.
 Review UI: Vite+React+Tailwind+shadcn SPA (webui/) served from webui/dist at /.
 Classification states: unclassified / no_bird / bird_identified / species_identified,
 each row carrying provenance (manual|ai, model, confidence, note, bbox) in ingest/labels.db.
-Every /upload photo is auto-reviewed in the background by an OpenAI-compatible vision
-endpoint (ingest/llm.py, LLM_* env): bird/no-bird + species + normalized bbox; the UI
-shows the box over each card and is for manual birder review. Manual review always
-wins locally. Needs LLM_API_KEY in ingest/.env.
+Every /upload photo is auto-reviewed in the background by the Jev decision
+model (ingest/jev.py, OpenRouter Decisions API, model typesafe/jev-1.14): a
+noul question answers P(bird) and a box question returns the bird bbox as
+image fractions — typed probabilities, no prompt-and-parse. Species is not
+auto: Jev cannot name species, so the birder sets species_identified in the
+UI (the fun part). The UI shows the box over each card. Manual review always
+wins locally. Needs OPENROUTER_API_KEY in ingest/.env (optional JEV_MODEL /
+JEV_BIRD_P, default threshold P(bird) >= 0.5).
 
 ## Hardware facts (verified this session)
 
@@ -92,6 +96,25 @@ wins locally. Needs LLM_API_KEY in ingest/.env.
    Pitfall fixed during test: uploads must be the raw JPEG request body — `curl -F` sends
    multipart and the whole envelope gets stored verbatim (corrupt file, classifier 400).
    Hardening: retries, buffers — open.
+6b. **AI switch: chat LLM → Jev decision model** — code DONE + verified 2026-11-01 (branch jev):
+   llm.py (OpenAI-compat chat + JSON parsing) replaced by jev.py: one POST
+   https://openrouter.ai/api/alpha/decisions with the frame in `state` asks two
+   typed questions — noul (P(bird)) and box (bird bbox as image fractions).
+   Same verdict shape as before, so app.py/review UI/CSV are unchanged; species
+   is intentionally never auto-set (Jev cannot name it; manual step stays).
+   Verified on real calls (typesafe/jev-1.14-20261014): 3 downloaded real bird
+   photos -> p_bird 0.95-0.98 with usable boxes (visual check: 2 tight, 1 clips
+   a tail tip); 2 of our human-labeled empty-feeder frames -> p_bird 0.05-0.07,
+   no box. ~0.3-0.5 s per frame, ~$0.00011 per call. End-to-end through
+   /upload -> background auto_classify -> /api/images on a throwaway :18077
+   server: no_bird + bird_identified rows correct, set_state species works.
+   Pitfalls learned: Jev 400s "Invalid image dimensions" on a 1280x1707 image
+   (1280x960 passes; our camera frames are 1024x768, fine); Box needs 1.14+;
+   Box has no not-found answer so the noul verdict gates it; Box/asset formats
+   are marked early features by TypeSafe. DEPLOY PENDING: merge branch jev,
+   add OPENROUTER_API_KEY to prod ingest/.env (the key in ~/.hermes/.env 401s —
+   revoked), restart birdhouse-ingest. Tune JEV_BIRD_P once real bird captures
+   exist (all 327 live labels are no_bird, so no positive calibration yet).
 
 Decision at end of Phase 3 (alt): stream probes to Pi for a real detector instead
 of on-device model — pipeline is the same either way.
@@ -103,6 +126,6 @@ of on-device model — pipeline is the same either way.
   - main/zone_config.h   zone rect + thresholds, the only knobs for tuning
   - test/                host gcc harness for the same detector source
   - partitions.csv       3 MB app partition (default 1 MB is too small)
-- ingest/     FastAPI ingest + classification API + kimi client
+- ingest/     FastAPI ingest + classification API + Jev decision client (jev.py)
 - webui/      review SPA (Vite + React + TS + Tailwind v4 + shadcn)
 - scripts/    host tooling (grab_photo.py, zone_preview.py)

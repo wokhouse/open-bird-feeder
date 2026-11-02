@@ -1,9 +1,10 @@
 """open-birdhouse ingest service (runs on the laptop in dev, the Pi in prod).
 
 Upload + AI classification + manual review for the bird training set.
-Every uploaded photo is auto-classified in the background by the
-OpenAI-compatible vision endpoint (llm.py): bird/no-bird, species, bounding
-box. The review UI is for human (birder) review of those AI verdicts.
+Every uploaded photo is auto-classified in the background by the Jev
+decision model (jev.py, OpenRouter Decisions API): bird/no-bird probability
++ bird bounding box. Species stays manual (Jev cannot name species): the
+birder sets 'species_identified' in the review UI.
 
 Image states: unclassified (no stored row) | no_bird | bird_identified |
 species_identified. Every classification carries provenance: manual vs ai,
@@ -36,7 +37,7 @@ import os
 import sqlite3
 from pathlib import Path
 
-import llm
+import jev
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import PlainTextResponse
@@ -185,11 +186,11 @@ def auto_classify(rel: str) -> None:
     """Background task kicked off by /upload. Sync on purpose: Starlette
     runs it in a worker thread, so a slow AI call never stalls the device POST.
     A failed verdict leaves the frame unclassified — 'AI bulk process' backfills."""
-    if not llm.configured():
-        print(f"[auto] {rel}: skipped, no {llm.KEY_ENV} set")
+    if not jev.configured():
+        print(f"[auto] {rel}: skipped, no {jev.KEY_ENV} set")
         return
     try:
-        verdict = llm.classify((DATA / rel).read_bytes())
+        verdict = jev.classify((DATA / rel).read_bytes())
         state = apply_verdict(rel, verdict)
         box = f" box={verdict['box']}" if verdict.get("box") else ""
         print(f"[auto] {rel}: {state}{box}")
@@ -242,13 +243,13 @@ async def set_state(request: Request):
     return {"ok": True, "path": rel, "state": state, "species": species}
 
 
-async def run_llm(rel: str) -> dict:
-    if not llm.configured():
-        raise HTTPException(502, f"AI not configured: set {llm.KEY_ENV} in ingest/.env")
+async def run_ai(rel: str) -> dict:
+    if not jev.configured():
+        raise HTTPException(502, f"AI not configured: set {jev.KEY_ENV} in ingest/.env")
     jpeg = (DATA / rel).read_bytes()
     try:
-        # llm.classify blocks on urllib: keep it off the event loop
-        verdict = await run_in_threadpool(llm.classify, jpeg)
+        # jev.classify blocks on urllib: keep it off the event loop
+        verdict = await run_in_threadpool(jev.classify, jpeg)
     except Exception as e:  # upstream hiccup: surface it, never poison the store
         raise HTTPException(502, f"AI call failed: {e}")
     state = apply_verdict(rel, verdict)
@@ -258,7 +259,7 @@ async def run_llm(rel: str) -> dict:
 @app.post("/api/classify")
 async def classify(request: Request):
     body = await request.json()
-    return await run_llm(safe_relpath(str(body.get("path", ""))))
+    return await run_ai(safe_relpath(str(body.get("path", ""))))
 
 
 @app.post("/api/classify_pending")
@@ -269,7 +270,7 @@ async def classify_pending(request: Request):
         body = {}
     limit = max(1, min(int(body.get("limit", 10)), 50))
     unclassified = [r["path"] for r in rows() if r["state"] == "unclassified"]
-    results = [await run_llm(p) for p in unclassified[:limit]]
+    results = [await run_ai(p) for p in unclassified[:limit]]
     return {"classified": len(results), "results": results}
 
 
