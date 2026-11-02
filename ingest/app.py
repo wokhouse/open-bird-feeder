@@ -42,6 +42,7 @@ Endpoints:
   /                                  webui/dist if built, else API pointer
 Run:  ./run.sh   (venv + uvicorn on 0.0.0.0:$PORT default 8078; reads ingest/.env)
 """
+import asyncio
 import csv
 import datetime
 import io
@@ -63,6 +64,9 @@ DATA.mkdir(parents=True, exist_ok=True)  # StaticFiles refuses a missing dir at 
 DB_PATH = Path(os.environ.get("INGEST_DB", Path(__file__).parent / "labels.db"))
 SAFE = lambda s: "".join(c for c in s if c.isalnum() or c in "-_.")[:48] or "unknown"
 STATES = ("no_bird", "bird_identified", "species_identified")
+# concurrent jev.classify calls per /api/classify_pending batch (each call is
+# 2 sequential upstream HTTP requests, so 4 here = at most 8 open connections)
+AI_CONCURRENCY = max(1, int(os.environ.get("JEV_CONCURRENCY", "4")))
 
 app = FastAPI(title="open-birdhouse ingest")
 
@@ -368,14 +372,31 @@ async def classify(request: Request):
 
 @app.post("/api/classify_pending")
 async def classify_pending(request: Request):
+    """AI over up to 50 unclassified frames. Runs JEV_CONCURRENCY (default 4)
+    calls at a time: one jev.classify is two sequential HTTP round-trips of up
+    to 60 s each, so a serial batch looks dead from the browser. A failed
+    image is counted and the rest of the batch proceeds - one upstream 502
+    must not throw away the verdicts already stored."""
     try:
         body = await request.json()
     except Exception:
         body = {}
     limit = max(1, min(int(body.get("limit", 10)), 50))
     unclassified = [r["path"] for r in rows() if r["state"] == "unclassified"]
-    results = [await run_ai(p) for p in unclassified[:limit]]
-    return {"classified": len(results), "results": results}
+    batch = unclassified[:limit]
+    sem = asyncio.Semaphore(AI_CONCURRENCY)
+
+    async def one(p: str):
+        async with sem:
+            return await run_ai(p)
+
+    done = await asyncio.gather(*(one(p) for p in batch), return_exceptions=True)
+    results = [d for d in done if not isinstance(d, BaseException)]
+    errors = [str(d) for d in done if isinstance(d, BaseException)]
+    if not results and errors:
+        raise HTTPException(502, errors[0])
+    return {"classified": len(results), "failed": len(errors),
+            "error": errors[0] if errors else None, "results": results}
 
 
 @app.get("/api/images")

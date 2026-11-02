@@ -48,5 +48,11 @@ export const setState = (path: string, state: State, species?: string) =>
   post('/api/set_state', { path, state, species })
 export const deletePhoto = (path: string) => post('/api/delete_photo', { path })
 export const classifyWithAI = (path: string) => post('/api/classify', { path })
-export const classifyPending = (limit: number) =>
+export interface BatchResult {
+  classified: number
+  failed: number
+  error: string | null
+  results: unknown[]
+}
+export const classifyPending = (limit: number): Promise<BatchResult> =>
   post('/api/classify_pending', { limit })

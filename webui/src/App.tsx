@@ -54,7 +54,12 @@ export default function App() {
     setClassifying(true)
     setError(null)
     try {
-      await classifyPending(10)
+      const res = await classifyPending(10)
+      if (res.failed > 0) {
+        setError(
+          `classified ${res.classified}, failed ${res.failed}: ${res.error ?? 'AI call failed'}`,
+        )
+      }
       await reload()
     } catch (e) {
       setError(
@@ -85,7 +90,7 @@ export default function App() {
         <div className="flex gap-2">
           <Button onClick={runAIBatch} disabled={classifying}>
             <Sparkles className="size-4" />
-            {classifying ? 'processing…' : 'AI bulk process'}
+            {classifying ? 'classifying…' : 'Bulk Classify'}
           </Button>
           <Button variant="outline" onClick={reload}>
             <RefreshCw className="size-4" />
