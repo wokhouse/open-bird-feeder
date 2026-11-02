@@ -5,3 +5,4 @@ data/
 webui/node_modules/
 webui/dist/
 .DS_Store
+ingest/labels.db
