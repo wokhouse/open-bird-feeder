@@ -15,8 +15,11 @@ Later phase 5b replaces the motion gate with an int8 bird/no-bird classifier
 
 Receiver (FastAPI): stores uploads under data/<kind>/<date>/HHMMSS_<device>.jpg.
 Review UI: Vite+React+Tailwind+shadcn SPA (webui/) served from webui/dist at /.
-Classification states: unclassified / no_bird / bird_identified / species_identified,
-each row carrying provenance (manual|ai, model, confidence, note, bbox) in ingest/labels.db.
+Classification states: unclassified / no_bird / bird_identified / species_identified.
+ingest/labels.db is schema v2 (see 6c): capture (file identity + device/time/bytes) /
+verdict (append-only AI history: model, p_bird, bbox, cost) / human_label (state +
+species, only set_state writes it). State is derived at read time: human label wins,
+else newest verdict vs JEV_BIRD_P.
 Every /upload photo is auto-reviewed in the background by the Jev decision
 model (ingest/jev.py, OpenRouter Decisions API, model typesafe/jev-1.14): a
 noul question answers P(bird) and a box question returns the bird bbox as
@@ -126,6 +129,26 @@ JEV_BIRD_P, default threshold P(bird) >= 0.5).
    merge jev -> main, restart birdhouse-ingest. Tune JEV_BIRD_P once real bird
    captures exist (all 327 live labels are no_bird, so no positive calibration
    yet).
+6c. **Storage schema v2: captures / verdicts / human labels split** — code DONE +
+   verified 2026-11-01 (branch schema-v2, from main@15dc71f): the fused
+   `classifications` table (one row per path, AI re-runs overwrote provenance,
+   p_bird smeared into note text) is replaced by capture (path/kind/device_id/
+   taken_at/bytes — the facts the filename was already carrying), verdict
+   (append-only AI history with structured p_bird REAL, model build, cost,
+   latency) and human_label (state+species; set_state is the only writer, so AI
+   re-runs physically cannot touch manual work). State derives at read time:
+   human wins, else newest verdict vs JEV_BIRD_P (legacy pre-Jev verdicts have no
+   structured probability — their confidence was not 1-P(bird) — so they keep
+   their old state verbatim), else unclassified. Payoff proven on the live data
+   copy: setting JEV_BIRD_P=0.05 flipped exactly the 2 Jev verdicts (p 0.070/
+   0.080) to bird without any API calls — threshold calibration now works on
+   history. /api/* wire format byte-identical to v1 (verified: /api/images,
+   /api/stats, /export.csv diff clean against the live server), so review UI,
+   CSV export and firmware are untouched. migrate_v2() rewrites at startup
+   (328 rows -> 328 capture + 274 verdict + 54 human_label) and keeps the old
+   table as classifications_v1. set_state unclassified now clears both label
+   and verdict history. Deploy: restart birdhouse-ingest (migration runs on
+   boot); back up labels.db first.
 
 Decision at end of Phase 3 (alt): stream probes to Pi for a real detector instead
 of on-device model — pipeline is the same either way.

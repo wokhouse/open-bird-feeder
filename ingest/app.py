@@ -6,13 +6,24 @@ decision model (jev.py, OpenRouter Decisions API): bird/no-bird probability
 + bird bounding box. Species stays manual (Jev cannot name species): the
 birder sets 'species_identified' in the review UI.
 
-Image states: unclassified (no stored row) | no_bird | bird_identified |
-species_identified. Every classification carries provenance: manual vs ai,
-which model, confidence, note, and for AI verdicts a normalized bounding box
-[x1,y1,x2,y2] in 0..1. Manual review always wins locally; re-running
-AI re-runs replaces provenance but never destroys an existing species label
-(set_state is the only species editor; manual-vs-AI precedence for other
-states is a hardening TODO in PLAN.md).
+Image states: unclassified (no stored verdict or human label) | no_bird |
+bird_identified | species_identified. Storage is schema v2: three tables that
+separate the concerns v1 fused into one row per path:
+
+  capture      one row per stored file: path, kind, device_id, taken_at, bytes
+  verdict      append-only AI history: model, p_bird, box, note, cost, latency
+  human_label  the birder's decision: state + species; only set_state writes it
+
+Read-side state derivation, in order: human_label if present, else the newest
+verdict (bird iff p_bird >= JEV_BIRD_P; pre-Jev verdicts, which have no
+structured probability, keep their old state verbatim), else unclassified.
+Payoffs: an AI re-run cannot touch manual work (different table); JEV_BIRD_P
+can be retuned against all past labels with zero API calls (raw probabilities
+are stored); new model builds can be compared on the same captures. The
+/api/* wire format is identical to v1 — state/confidence/note/box are derived
+at read time — so the review UI and firmware need no changes.
+migrate_v2() rewrites a v1 `classifications` table at startup and keeps the
+original as `classifications_v1` for audit.
 
 Endpoints:
   POST /upload?kind=photo|probe      raw JPEG body; headers: X-Device-Id,
@@ -35,6 +46,7 @@ import datetime
 import io
 import json
 import os
+import re
 import sqlite3
 from pathlib import Path
 
@@ -58,45 +70,92 @@ def db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, timeout=10)  # wait on locks, don't fail instantly
     conn.row_factory = sqlite3.Row  # rows() indexes columns by name
     conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS classifications("
-        "path TEXT PRIMARY KEY, state TEXT NOT NULL, source TEXT NOT NULL, "
-        "species TEXT, confidence REAL, note TEXT, model TEXT, box TEXT, ts TEXT NOT NULL)"
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS capture(
+          id INTEGER PRIMARY KEY, path TEXT UNIQUE NOT NULL, kind TEXT NOT NULL,
+          device_id TEXT, taken_at TEXT, bytes INTEGER, ingested_at TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS verdict(
+          id INTEGER PRIMARY KEY, capture_id INTEGER NOT NULL REFERENCES capture(id),
+          model TEXT NOT NULL, p_bird REAL, state_hint TEXT, box TEXT, note TEXT,
+          confidence REAL, cost_usd REAL, latency_ms INTEGER, ts TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS human_label(
+          capture_id INTEGER PRIMARY KEY REFERENCES capture(id),
+          state TEXT NOT NULL, species TEXT, note TEXT, ts TEXT NOT NULL);
+        CREATE INDEX IF NOT EXISTS verdict_latest
+          ON verdict(capture_id, id DESC);
+        """
     )
     return conn
 
 
-def migrate_box_column() -> None:
-    """Add the AI bounding-box column to pre-existing DBs (runs at startup only)."""
-    conn = db()
-    cols = {r["name"] for r in conn.execute("PRAGMA table_info(classifications)")}
-    if "box" not in cols:
-        conn.execute("ALTER TABLE classifications ADD COLUMN box TEXT")
-        conn.commit()
-
-
-def migrate_v1_labels() -> None:
-    """One-time migration from the v1 binary-label table (runs at startup only)."""
-    conn = db()
-    if not conn.execute("SELECT 1 FROM sqlite_master WHERE name='labels'").fetchone():
-        return
-    for path, lab, ts in conn.execute("SELECT path,label,ts FROM labels"):
-        state = "bird_identified" if lab == "bird" else "no_bird"
-        conn.execute(
-            "INSERT OR IGNORE INTO classifications"
-            "(path,state,source,species,confidence,note,model,ts) VALUES(?,?,?,?,?,?,?,?)",
-            (path, state, "manual", None, None, None, "v1-labels-migrated", ts),
-        )
-    conn.execute("DROP TABLE labels")
-    conn.commit()
-
-
-migrate_box_column()
-migrate_v1_labels()
-
-
 def now() -> str:
     return datetime.datetime.now().isoformat(timespec="seconds")
+
+
+# photo/2026-11-01/194416_xiao-1e85fc(_2).jpg -> date, HHMMSS, device
+CAP_PARSE = re.compile(
+    r"(\w+)/(\d{4}-\d{2}-\d{2})/(\d{6})_([\w.-]+?)(?:_\d+)?\.jpg$")
+
+
+def ensure_capture(conn, rel: str, kind: str = "photo", device: str | None = None,
+                   taken_at: str | None = None, size: int | None = None) -> int:
+    """One capture row per stored file. Device and capture time are parsed from
+    the storage path when not supplied at upload — the filename has been
+    carrying these facts all along; now they are columns."""
+    row = conn.execute("SELECT id FROM capture WHERE path=?", (rel,)).fetchone()
+    if row:
+        return row["id"]
+    m = CAP_PARSE.match(rel)
+    if m:
+        taken_at = taken_at or f"{m.group(2)}T{m.group(3)[:2]}:{m.group(3)[2:4]}:{m.group(3)[4:6]}"
+        device = device or m.group(4)
+    if size is None:
+        p = DATA / rel
+        size = p.stat().st_size if p.is_file() else None
+    conn.execute(
+        "INSERT OR IGNORE INTO capture(path,kind,device_id,taken_at,bytes,ingested_at) "
+        "VALUES(?,?,?,?,?,?)", (rel, kind, device, taken_at, size, now()))
+    return conn.execute("SELECT id FROM capture WHERE path=?", (rel,)).fetchone()["id"]
+
+
+def migrate_v2() -> None:
+    """Rewrite a v1 `classifications` table (one fused row per path) into
+    capture/verdict/human_label. Runs at startup while the old table exists;
+    leaves it as `classifications_v1` for audit.
+
+    Manual rows become human_label. AI rows become verdicts, with an honest
+    split: Jev notes carry a structured p_bird we can parse back; pre-Jev
+    chat-LLM rows get NO invented probability (their "confidence" was not
+    1-P(bird) — two live rows disprove that), so they keep their old state
+    verbatim in state_hint and their old confidence for display parity.
+    """
+    conn = db()
+    if not conn.execute("SELECT 1 FROM sqlite_master WHERE name='classifications'").fetchone():
+        return
+    n_human = n_verdict = 0
+    for r in conn.execute("SELECT * FROM classifications"):
+        cid = ensure_capture(conn, r["path"])
+        if r["source"] == "manual":
+            conn.execute(
+                "INSERT OR REPLACE INTO human_label(capture_id,state,species,note,ts) "
+                "VALUES(?,?,?,?,?)", (cid, r["state"], r["species"], r["note"], r["ts"]))
+            n_human += 1
+        else:
+            m = re.search(r"p_bird=([0-9.]+)", r["note"] or "")
+            conn.execute(
+                "INSERT INTO verdict(capture_id,model,p_bird,state_hint,box,note,"
+                "confidence,cost_usd,latency_ms,ts) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (cid, r["model"] or "legacy", float(m.group(1)) if m else None,
+                 r["state"], r["box"], r["note"], r["confidence"], None, None, r["ts"]))
+            n_verdict += 1
+    conn.execute("ALTER TABLE classifications RENAME TO classifications_v1")
+    conn.commit()
+    print(f"[migrate_v2] rewrote {n_human} human labels, {n_verdict} verdicts; "
+          f"old table kept as classifications_v1")
+
+
+migrate_v2()
 
 
 def list_images() -> list[str]:
@@ -114,21 +173,40 @@ def safe_relpath(rel: str) -> str:
 
 
 def rows() -> list[dict]:
-    cls = {r["path"]: dict(r) for r in db().execute("SELECT * FROM classifications")}
+    """Review-queue entries; the wire format is byte-for-byte what v1 stored.
+    State derives at read time: human_label wins, else the newest verdict
+    (bird iff p_bird >= JEV_BIRD_P; legacy state_hint verbatim), else
+    unclassified. Because raw probabilities are stored, retuning JEV_BIRD_P
+    re-labels all history with zero API calls."""
+    conn = db()
+    caps = {r["path"]: r["id"] for r in conn.execute("SELECT id, path FROM capture")}
+    humans = {r["capture_id"]: dict(r) for r in conn.execute("SELECT * FROM human_label")}
+    latest = {r["capture_id"]: dict(r) for r in conn.execute(
+        "SELECT * FROM verdict WHERE id IN "
+        "(SELECT MAX(id) FROM verdict GROUP BY capture_id)")}
     out = []
     for p in list_images():
-        c = cls.get(p) or {}
-        out.append(
-            {
-                "path": p,
-                "state": c.get("state", "unclassified"),
-                "species": c.get("species"),
-                "source": c.get("source"),
-                "confidence": c.get("confidence"),
-                "note": c.get("note"),
-                "box": json.loads(c["box"]) if c.get("box") else None,
-            }
-        )
+        cid = caps.get(p)
+        h = humans.get(cid) if cid is not None else None
+        v = latest.get(cid) if cid is not None else None
+        if h:
+            out.append({"path": p, "state": h["state"], "species": h["species"],
+                        "source": "manual", "confidence": None,
+                        "note": h["note"], "box": None})
+        elif v:
+            if v["p_bird"] is not None:
+                bird = v["p_bird"] >= jev.BIRD_P
+                conf = round(v["p_bird"] if bird else 1.0 - v["p_bird"], 4)
+            else:  # pre-Jev verdict: state and confidence kept verbatim
+                bird = v["state_hint"] == "bird_identified"
+                conf = v["confidence"]
+            out.append({"path": p, "state": "bird_identified" if bird else "no_bird",
+                        "species": None, "source": "ai", "confidence": conf,
+                        "note": v["note"],
+                        "box": json.loads(v["box"]) if v["box"] else None})
+        else:
+            out.append({"path": p, "state": "unclassified", "species": None,
+                        "source": None, "confidence": None, "note": None, "box": None})
     return out
 
 
@@ -174,6 +252,8 @@ async def upload(request: Request, background_tasks: BackgroundTasks, kind: str 
         n += 1
     path.write_bytes(body)
     rel = str(path.relative_to(DATA))
+    with db() as conn:  # the device/time/size facts the filename was faking
+        ensure_capture(conn, rel, kind, device, ts.isoformat(timespec="seconds"), len(body))
     if kind == "probe":
         save_motion_grid(path, request.headers)
     else:
@@ -203,37 +283,20 @@ def auto_classify(rel: str) -> None:
         print(f"[auto] {rel}: AI FAILED: {e}")
 
 
-def set_row(rel: str, state: str, source: str, species=None, confidence=None,
-            note=None, model=None, box=None) -> None:
-    ts = now()
-    box_json = json.dumps(box) if box else None
-    with db() as conn:
-        conn.execute(
-            "INSERT INTO classifications(path,state,source,species,confidence,note,model,box,ts) "
-            "VALUES(?,?,?,?,?,?,?,?,?) "
-            "ON CONFLICT(path) DO UPDATE SET state=?,source=?,species=?,confidence=?, "
-            "note=?,model=?,box=?,ts=?",
-            (rel, state, source, species, confidence, note, model, box_json, ts,
-             state, source, species, confidence, note, model, box_json, ts),
-        )
-
-
 def apply_verdict(rel: str, v: dict) -> str:
-    """Store an AI verdict. Species is never written by AI, and an existing
-    species label survives any re-run (set_state is the only species editor),
-    so re-classifying a species_identified frame cannot destroy manual work."""
+    """Append an AI verdict. Verdicts are append-only history and human labels
+    live in their own table, so a re-run can never destroy manual work and
+    every model's probability stays on file for calibration and comparison."""
     with db() as conn:
-        prev = conn.execute("SELECT species FROM classifications WHERE path=?", (rel,)).fetchone()
-    species = v["species"] or (prev["species"] if prev else None)
-    if species:
-        state = "species_identified"
-    elif not v["bird"]:
-        state = "no_bird"
-    else:
-        state = "bird_identified"
-    set_row(rel, state, "ai", species, v["confidence"], v["note"],
-            v.get("model"), box=v.get("box"))
-    return state
+        cid = ensure_capture(conn, rel)
+        conn.execute(
+            "INSERT INTO verdict(capture_id,model,p_bird,box,note,cost_usd,latency_ms,ts) "
+            "VALUES(?,?,?,?,?,?,?,?)",
+            (cid, v.get("model") or jev.MODEL, v.get("p_bird"),
+             json.dumps(v["box"]) if v.get("box") else None, v.get("note"),
+             v.get("cost_usd"), v.get("latency_ms"), now()))
+        h = conn.execute("SELECT state FROM human_label WHERE capture_id=?", (cid,)).fetchone()
+    return h["state"] if h else ("bird_identified" if v["bird"] else "no_bird")
 
 
 @app.post("/api/set_state")
@@ -242,15 +305,23 @@ async def set_state(request: Request):
     rel = safe_relpath(str(body.get("path", "")))
     state = str(body.get("state", ""))
     species = str(body.get("species", "") or "").strip() or None
-    if state == "unclassified":
+    if state == "unclassified":  # full reset: human label AND AI history go
         with db() as conn:
-            conn.execute("DELETE FROM classifications WHERE path=?", (rel,))
+            cid = conn.execute("SELECT id FROM capture WHERE path=?", (rel,)).fetchone()
+            if cid:
+                conn.execute("DELETE FROM human_label WHERE capture_id=?", (cid["id"],))
+                conn.execute("DELETE FROM verdict WHERE capture_id=?", (cid["id"],))
         return {"ok": True, "path": rel, "state": "unclassified"}
     if state not in STATES:
         raise HTTPException(400, f"state must be one of {STATES + ('unclassified',)}")
     if state == "species_identified" and not species:
         raise HTTPException(400, "species_identified requires a species name")
-    set_row(rel, state, "manual", species)
+    with db() as conn:
+        cid = ensure_capture(conn, rel)
+        conn.execute(
+            "INSERT INTO human_label(capture_id,state,species,ts) VALUES(?,?,?,?) "
+            "ON CONFLICT(capture_id) DO UPDATE SET state=?,species=?,ts=?",
+            (cid, state, species, now(), state, species, now()))
     return {"ok": True, "path": rel, "state": state, "species": species}
 
 

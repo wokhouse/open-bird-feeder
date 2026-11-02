@@ -144,6 +144,7 @@ def classify(jpeg: bytes) -> dict:
 
     return {
         "bird": bird,
+        "p_bird": round(p, 6),  # structured probability: stored for threshold calibration
         "species": None,  # Jev cannot name species: manual step in the UI
         "box": box,
         "confidence": round(p if bird else 1.0 - p, 4),
