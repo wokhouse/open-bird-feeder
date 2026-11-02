@@ -1,3 +1,6 @@
 .env
 labels.db-wal
 labels.db-shm
+
+# model-switch config backups
+.env.bak*

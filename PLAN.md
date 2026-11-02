@@ -181,6 +181,41 @@ JEV_BIRD_P, default threshold P(bird) >= 0.5).
    and verdict history. Deploy: restart open-bird-feeder-ingest (migration runs on
    boot); back up labels.db first.
 
+6d. **Cheaper decision models for bird/no-bird (bake-off 2026-11-02)** — the
+   Decisions category has grown to 33 models (23 image-capable); all speak the
+   same `POST /api/alpha/decisions` contract, so `JEV_MODEL` in ingest/.env is a
+   one-line switch (`_supports_box` already gates Box off non-Jev models).
+   Measured on a 29-frame evalset (20 bird / 9 no-bird, Wikimedia feeder-scene
+   photos: perched songbirds + squirrel/empty-feeder negatives, 900px, visual-QC
+   relabelled), same noul payload as jev.py, threshold 0.5:
+   | model | acc | min p(bird) | max p(nobird) | $/img | tok/img |
+   | typesafe/jev-1.14 (current) | 29/29 | 0.970 | 0.300 | 0.000091 | 2170 |
+   | perplexity/pplx-decider-flash-v1.2 | 29/29 | 0.976 | 0.026 | 0.000008 | 817 |
+   | inception/mercury-decide | 29/29 | 0.998 | 0.004 | 0.000016 | 779 |
+   | perplexity/pplx-decider-v1.2 | 29/29 | 0.990 | 0.088 | 0.000016 | 817 |
+   | liquid/d1.1 | 29/29 | 0.996 | 0.069 | 0.000022 | 1112 |
+   | cloudflare/clef-flash | 29/29 | 0.822 | 0.117 | 0.000033 | 863 |
+   | baseten/joey-1 | 28/29 | 0.976 | 0.904 | 0.000009 | — (1 FP on a birdbath frame) |
+   Live Jev baseline from labels.db: $0.000106/img avg over 293 verdicts.
+   Box questions remain Jev-only, so any switch drops the bbox enrichment —
+   and on this question even Jev only reaches max-p 0.30 on no-birds: the
+   cheap models separate the classes harder. Caveats: evalset is DSLR-closeup
+   positives, not yet small
+   birds in the fixed 1024x768 frame; re-run the margin check on real captures
+   before flipping the default. Best all-round switch: pplx-decider-flash-v1.2
+   (12x cheaper, margin 0.976/0.026); best margin: mercury-decide. Keep-a-box
+   option: cheap noul gate first, Jev-1.14 Box question only on bird=True
+   frames — with a ~100% no-bird live stream that pays for Box anyway.
+   Scripts: ~/.hermes/cache/scratch/{fetch_commons,bakeoff}.py,
+   bakeoff_results.json next to them.
+   SWITCH EXECUTED 2026-11-02 per decision (bbox explicitly deprioritized
+   until real bird photos exist): ingest/.env (backed up .env.bak-20261102)
+   now sets JEV_MODEL=perplexity/pplx-decider-flash-v1.2; service restarted,
+   active; verified through jev.py on evalset frames — bird p=0.991 / no-bird
+   p=0.006, box=None as expected, model provenance
+   perplexity/pplx-decider-flash-v1.2-20261016, ~$0.00001/img. Re-add a
+   box-capable model (Jev or other) once bird photos are in hand.
+
 Decision at end of Phase 3 (alt): stream probes to Pi for a real detector instead
 of on-device model — pipeline is the same either way.
 
