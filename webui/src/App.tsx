@@ -58,7 +58,7 @@ export default function App() {
       await reload()
     } catch (e) {
       setError(
-        errMsg(e) + ' — set LLM_API_KEY in ingest/.env',
+        errMsg(e),
       )
     } finally {
       setClassifying(false)

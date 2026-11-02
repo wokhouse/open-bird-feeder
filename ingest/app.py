@@ -10,8 +10,9 @@ Image states: unclassified (no stored row) | no_bird | bird_identified |
 species_identified. Every classification carries provenance: manual vs ai,
 which model, confidence, note, and for AI verdicts a normalized bounding box
 [x1,y1,x2,y2] in 0..1. Manual review always wins locally; re-running
-AI re-runs replace the row either way in v0;
-manual-vs-AI precedence is a hardening TODO in PLAN.md).
+AI re-runs replaces provenance but never destroys an existing species label
+(set_state is the only species editor; manual-vs-AI precedence for other
+states is a hardening TODO in PLAN.md).
 
 Endpoints:
   POST /upload?kind=photo|probe      raw JPEG body; headers: X-Device-Id,
@@ -192,8 +193,12 @@ def auto_classify(rel: str) -> None:
     try:
         verdict = jev.classify((DATA / rel).read_bytes())
         state = apply_verdict(rel, verdict)
-        box = f" box={verdict['box']}" if verdict.get("box") else ""
-        print(f"[auto] {rel}: {state}{box}")
+        extra = ""
+        if verdict.get("box"):
+            extra += f" box={verdict['box']}"
+        if verdict.get("cost_usd") is not None:
+            extra += f" cost={verdict['cost_usd']:.6f} latency={verdict.get('latency_ms')}ms"
+        print(f"[auto] {rel}: {state}{extra}")
     except Exception as e:
         print(f"[auto] {rel}: AI FAILED: {e}")
 
@@ -214,13 +219,19 @@ def set_row(rel: str, state: str, source: str, species=None, confidence=None,
 
 
 def apply_verdict(rel: str, v: dict) -> str:
-    if not v["bird"]:
-        state = "no_bird"
-    elif v["species"]:
+    """Store an AI verdict. Species is never written by AI, and an existing
+    species label survives any re-run (set_state is the only species editor),
+    so re-classifying a species_identified frame cannot destroy manual work."""
+    with db() as conn:
+        prev = conn.execute("SELECT species FROM classifications WHERE path=?", (rel,)).fetchone()
+    species = v["species"] or (prev["species"] if prev else None)
+    if species:
         state = "species_identified"
+    elif not v["bird"]:
+        state = "no_bird"
     else:
         state = "bird_identified"
-    set_row(rel, state, "ai", v["species"], v["confidence"], v["note"],
+    set_row(rel, state, "ai", species, v["confidence"], v["note"],
             v.get("model"), box=v.get("box"))
     return state
 

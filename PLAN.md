@@ -89,7 +89,9 @@ JEV_BIRD_P, default threshold P(bird) >= 0.5).
    as systemd unit birdhouse-ingest.service — repo at /home/fungj/repos/open-birdhouse
    (pull from GitHub main), venv, uvicorn on 0.0.0.0:8077, Restart=on-failure. ingest/.env
    sets LLM_BASE_URL=http://100.73.247.126:8080/v1 (bingbong over its Tailscale IP —
-   bingbong.local does not resolve from the Pi) + the API key. Data + labels.db migrated
+   bingbong.local does not resolve from the Pi) + the API key. NOTE superseded by phase 6b:
+   the service now reads OPENROUTER_API_KEY + JEV_MODEL; the LLM_* variables are retired.
+   Data + labels.db migrated
    from the laptop; laptop service stopped, :8077 there is free. Device INGEST_BASE =
    http://192.168.1.217:8077 (secrets.h, reflashed; device now at 192.168.1.123 via DHCP).
    Web UI: http://sleepy.tail643d2.ts.net:8077 (tailnet/MagicDNS) or sleepy.local:8077 (LAN).
@@ -111,10 +113,19 @@ JEV_BIRD_P, default threshold P(bird) >= 0.5).
    Pitfalls learned: Jev 400s "Invalid image dimensions" on a 1280x1707 image
    (1280x960 passes; our camera frames are 1024x768, fine); Box needs 1.14+;
    Box has no not-found answer so the noul verdict gates it; Box/asset formats
-   are marked early features by TypeSafe. DEPLOY PENDING: merge branch jev,
-   add OPENROUTER_API_KEY to prod ingest/.env (the key in ~/.hermes/.env 401s —
-   revoked), restart birdhouse-ingest. Tune JEV_BIRD_P once real bird captures
-   exist (all 327 live labels are no_bird, so no positive calibration yet).
+   are marked early features by TypeSafe. Reviewed by two read-only subagents
+   (API contract + integration); fixes applied: AI re-runs never destroy an
+   existing species label (set_state is the only species editor); the box
+   question is gated on model support so a JEV_MODEL < 1.14 still yields the
+   noul verdict; bad/out-of-range JEV_BIRD_P falls back to 0.5 with a warning
+   instead of crashing the service or poisoning every label; one retry on
+   429/5xx; error bodies decoded defensively with error.message surfaced;
+   rejected boxes traced as box=rejected; stale LLM_API_KEY hints removed
+   (webui banner, run.sh). DEPLOY: prod ingest/.env now carries
+   OPENROUTER_API_KEY (~/.hermes/.env key updated too; the old one 401s),
+   merge jev -> main, restart birdhouse-ingest. Tune JEV_BIRD_P once real bird
+   captures exist (all 327 live labels are no_bird, so no positive calibration
+   yet).
 
 Decision at end of Phase 3 (alt): stream probes to Pi for a real detector instead
 of on-device model — pipeline is the same either way.
