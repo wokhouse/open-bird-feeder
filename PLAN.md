@@ -2,7 +2,9 @@
 
 XIAO ESP32S3 Sense (onboard camera, 8MB PSRAM) takes bird photos and POSTs
 them to an ingest service on the LAN (dev: this laptop, prod: a Pi).
-Hardwired to power; on-device bird/no-bird model gates capture.
+Power: USB-C battery bank at the feeder (battery kept over a cord, 2026-11-01;
+enclosure installs must be power-efficient without missing wildlife — see 5c).
+On-device bird/no-bird model gates capture.
 
 ## Architecture
 
@@ -88,6 +90,28 @@ JEV_BIRD_P, default threshold P(bird) >= 0.5).
 5b. **On-device gating (classifier)** — train bird/no-bird on the real mounting
    scene (negatives = the actual background), flash int8 model, probe loop
    replaced by the classifier, debounce + burst capture on bird edges.
+5c. **Battery operation** — design note 2026-11-01, nothing built yet. The feeder
+   device runs from a USB-C power bank. Current firmware streams the sensor
+   continuously + keeps Wi-Fi connected: estimated 1.3-1.7 W, NOT measured
+   (Seeed board specs: Wi-Fi-on ~100 mA, light-sleep 2 mA, deep-sleep 14 uA;
+   QQVGA streaming draw unknown). A 10 000 mAh bank = 37 Wh ≈ one day.
+   MEASURE FIRST: charge the bank to 100%, run N hours, read the remaining %;
+   draw_W = bank_Wh × pct/100 / N.
+   Key fact: dropping probe fps saves almost nothing — the OV2640 + DVP DMA
+   stream at their own rate no matter how slowly we grab frames. Power comes
+   from stopping the stream, not from slower polling.
+   Ladder (capture quality first):
+   1. Wi-Fi dial-before-call: connect only to upload. ~0.2-0.3 W saved, zero
+      capture cost. Firmware change, safe.
+   2. PIR wake + deep sleep (the trail-cam architecture): deep-sleep until the
+      PIR fires, then run the existing probe+capture loop, idle-timeout back to
+      sleep. Weeks per bank. Two hardware catches: the PIR must see the tray
+      (window/lens in the enclosure), and average draw under ~50 mA trips the
+      bank's low-load auto-off — a PIR build must move to the Sense BAT pads
+      (onboard single-cell charger SGM40567, ≤110 mA charge) instead of a bank.
+   3. Enclosure end-state for installers: LiPo/18650 on the BAT pads + small
+      solar (charge caps at 110 mA ≈ 0.4 W average). Solves the auto-off catch.
+   Keep the bank inside the enclosure (cold cuts Li-ion capacity).
 6. **Pi deployment** — DONE 2026-11-01 (service part): ingest runs on sleepy (Pi, Debian 13)
    as systemd unit open-bird-feeder-ingest.service — repo at /home/fungj/repos/open-bird-feeder
    (pull from GitHub main), venv, uvicorn on 0.0.0.0:8077, Restart=on-failure. ingest/.env
