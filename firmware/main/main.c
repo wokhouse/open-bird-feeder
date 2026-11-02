@@ -8,9 +8,10 @@
 // A heartbeat photo every HEARTBEAT_MS keeps the timer path alive for
 // troubleshooting (set HEARTBEAT_MS to 0 to disable).
 // Wi-Fi is dial-before-call (phase 5c): the radio stays off while probing.
-// Each capture cycle connects, uploads photo + probe frame, then powers the
-// radio down again. On wifi failure the capture is skipped; retries are
-// rate-limited by the refractory window.
+// Each capture cycle dials once, waits WIFI_CONNECT_WAIT_MS for an IP,
+// uploads photo + probe frame, then powers the radio down again. On dial
+// failure the whole cycle is skipped and the motion gate backs off
+// exponentially (refractory << consecutive skips, capped ~2 min).
 //
 // Credentials/URL live in secrets.h. Console is USB-CDC only.
 
@@ -70,6 +71,10 @@ static const char *TAG = "birdcam";
 
 #define REFRACTORY_MS 4000  /* ignore motion this long after a capture */
 #define HEARTBEAT_MS  900000 /* 15 min: one photo when nothing moves (0 = off) */
+
+/* Wi-Fi dial (phase 5c): one IP budget, then exponential skip backoff. */
+#define WIFI_CONNECT_WAIT_MS 8000  /* IP budget after dialing */
+#define SKIP_BACKOFF_MAX 5         /* motion gate: refractory << skips, cap 128 s */
 #define LOG_EVERY_FRAMES 400 /* one info line per ~60 s of probing */
 
 /* Cap on the hex-encoded hot-cell bitmap we put in the X-Motion-Grid header
@@ -79,9 +84,12 @@ static const char *TAG = "birdcam";
 #define WIFI_CONNECTED_BIT BIT0
 
 static EventGroupHandle_t s_wifi_events;
-static bool s_wifi_wanted;   /* retry connects while true */
-static bool s_wifi_started;  /* radio is powered on */
-static bool s_wifi_up;       /* got an ip */
+/* Written from the event-loop task, read from the app task: volatile so the
+ * cross-task checks stay honest under -O2. The event-group bit is the sync
+ * point; these flags only mirror driver state. */
+static volatile bool s_wifi_wanted;   /* retry connects while true */
+static volatile bool s_wifi_started;  /* esp_wifi driver is up */
+static volatile bool s_wifi_up;       /* got an ip */
 static char s_device_id[24];
 static zone_motion_t s_zone;
 static bool s_zone_ready;
@@ -139,15 +147,23 @@ static void camera_stop(void)
 static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
-        if (s_wifi_wanted) esp_wifi_connect();
+        if (s_wifi_wanted) {
+            esp_err_t err = esp_wifi_connect();
+            if (err != ESP_OK) ESP_LOGE(TAG, "connect from STA_START: %s", esp_err_to_name(err));
+        }
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
+        if (!s_wifi_started) return; /* deferred event from our own esp_wifi_stop */
         s_wifi_up = false;
         xEventGroupClearBits(s_wifi_events, WIFI_CONNECTED_BIT);
         if (s_wifi_wanted) {
             ESP_LOGW(TAG, "wifi disconnected, retrying");
-            esp_wifi_connect();
+            esp_err_t err = esp_wifi_connect();
+            if (err != ESP_OK) ESP_LOGE(TAG, "connect retry: %s", esp_err_to_name(err));
         }
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
+        /* A late GOT_IP after wifi_power_down() must not resurrect "up":
+         * the radio is off, and only wifi_connect_start() may dial it. */
+        if (!s_wifi_wanted) return;
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)data;
         ESP_LOGI(TAG, "got ip: " IPSTR, IP2STR(&event->ip_info.ip));
         s_wifi_up = true;
@@ -167,7 +183,7 @@ static void wifi_init(void)
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
     ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL));
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL));
 
     wifi_config_t wc = { 0 };
     strlcpy((char *)wc.sta.ssid, WIFI_SSID, sizeof(wc.sta.ssid));
@@ -177,20 +193,29 @@ static void wifi_init(void)
 }
 
 /* Power the radio on and start connecting. Completion is the GOT_IP bit;
- * wait for it with wifi_ready(). */
-static void wifi_connect_start(void)
+ * wait for it with wifi_ready(). Returns non-ESP_OK when the dial itself
+ * failed, so callers can skip the IP wait entirely. */
+static esp_err_t wifi_connect_start(void)
 {
-    if (s_wifi_up) return;
+    if (s_wifi_up) return ESP_OK;
     s_wifi_wanted = true;
     xEventGroupClearBits(s_wifi_events, WIFI_CONNECTED_BIT);
-    if (!s_wifi_started) {
-        esp_err_t err = esp_wifi_start(); /* the STA_START event connects via the handler */
-        if (err != ESP_OK) ESP_LOGE(TAG, "wifi start failed: %s", esp_err_to_name(err));
-        else s_wifi_started = true;
-    } else {
+    if (s_wifi_started) {
         esp_err_t err = esp_wifi_connect();
-        if (err != ESP_OK) ESP_LOGW(TAG, "wifi connect request: %s", esp_err_to_name(err));
+        if (err != ESP_OK && err != ESP_ERR_WIFI_CONN) {
+            ESP_LOGE(TAG, "wifi connect: %s", esp_err_to_name(err));
+            return err;
+        }
+        return ESP_OK; /* ESP_ERR_WIFI_CONN: a connect is already in flight */
     }
+    esp_err_t err = esp_wifi_start(); /* STA_START event connects via handler */
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "wifi start: %s", esp_err_to_name(err));
+        s_wifi_wanted = false;
+        return err;
+    }
+    s_wifi_started = true;
+    return ESP_OK;
 }
 
 /* Block until an IP is held (returns at once when already connected). */
@@ -208,9 +233,14 @@ static void wifi_power_down(void)
     s_wifi_up = false;
     xEventGroupClearBits(s_wifi_events, WIFI_CONNECTED_BIT);
     if (s_wifi_started) {
-        esp_wifi_disconnect();
-        esp_wifi_stop();
-        s_wifi_started = false;
+        esp_wifi_disconnect(); /* result is noise; the stop below is what counts */
+        esp_err_t err = esp_wifi_stop();
+        if (err != ESP_OK) {
+            /* keep s_wifi_started set: the flags must mirror the driver */
+            ESP_LOGE(TAG, "wifi stop: %s", esp_err_to_name(err));
+        } else {
+            s_wifi_started = false;
+        }
     }
 }
 
@@ -221,11 +251,6 @@ static bool upload_bytes(const uint8_t *buf, size_t len, const char *kind,
                          const char *content_type, int hot, int global,
                          const char *grid)
 {
-    if (!wifi_ready(15000)) {
-        ESP_LOGW(TAG, "upload %s skipped: no wifi (connect failed?)", kind);
-        return false;
-    }
-
     char url[128];
     snprintf(url, sizeof(url), "%s/upload?kind=%s", INGEST_BASE, kind);
 
@@ -406,7 +431,7 @@ void app_main(void)
     ESP_LOGI(TAG, "probing at %.1f fps, heartbeat %d ms, wifi=dial-before-call", 1000.0f / PROBE_INTERVAL_MS, HEARTBEAT_MS);
 
     int64_t last_capture_ms = esp_timer_get_time() / 1000;
-    unsigned captures = 0, skips = 0;
+    unsigned captures = 0, skips = 0, skip_streak = 0;
 
     while (true) {
         camera_fb_t *fb = esp_camera_fb_get();
@@ -445,7 +470,13 @@ void app_main(void)
 
         bool shoot = false;
         const char *why = NULL;
-        if (r.trigger && since_ms >= REFRACTORY_MS) {
+        /* Consecutive dial failures back the motion gate off exponentially:
+         * sustained zone motion during an outage must not hammer the radio
+         * or leave long blind spots. The heartbeat path is gated by
+         * HEARTBEAT_MS, not by this. */
+        const int backoff_exp = (int)skip_streak > SKIP_BACKOFF_MAX ? SKIP_BACKOFF_MAX : (int)skip_streak;
+        const int64_t motion_gap_ms = (int64_t)REFRACTORY_MS << backoff_exp;
+        if (r.trigger && since_ms >= motion_gap_ms) {
             shoot = true;
             why = "motion";
         } else if (HEARTBEAT_MS > 0 && since_ms >= HEARTBEAT_MS) {
@@ -454,22 +485,27 @@ void app_main(void)
         }
 
         if (shoot) {
-            wifi_connect_start();
-            upload_probe(fb, &r);
-            esp_camera_fb_return(fb);
-            fb = NULL;
-            if (wifi_ready(1500)) {
+            /* One IP gate up front: with no wifi the whole cycle is skipped
+               before any encode or camera mode switch is paid for. */
+            esp_err_t dial = wifi_connect_start();
+            if (dial == ESP_OK && wifi_ready(WIFI_CONNECT_WAIT_MS)) {
+                upload_probe(fb, &r);
+                esp_camera_fb_return(fb);
+                fb = NULL;
                 capture_photo(why, &r);
                 last_capture_ms = esp_timer_get_time() / 1000;
                 captures++;
+                skip_streak = 0;
             } else {
-                /* No IP: skip the capture instead of switching camera modes
-                 * for a photo we cannot upload. The timestamp still moves so
-                 * retries stay rate-limited, and the reference frame is reset
-                 * because it went stale during the connect wait. */
+                /* No IP: advance the timestamp anyway so the retry respects
+                   the backoff, and reset the reference frame: it went stale
+                   while the radio was dialing. */
                 ESP_LOGW(TAG, "%s capture skipped: wifi not up", why);
+                esp_camera_fb_return(fb);
+                fb = NULL;
                 last_capture_ms = esp_timer_get_time() / 1000;
                 skips++;
+                if (skip_streak < SKIP_BACKOFF_MAX) skip_streak++;
                 zone_motion_reset(&s_zone);
             }
             wifi_power_down();
