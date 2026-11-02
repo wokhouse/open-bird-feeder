@@ -227,6 +227,11 @@ JEV_BIRD_P, default threshold P(bird) >= 0.5).
    p=0.006, box=None as expected, model provenance
    perplexity/pplx-decider-flash-v1.2-20261016, ~$0.00001/img. Re-add a
    box-capable model (Jev or other) once bird photos are in hand.
+   Adversarial probe 2026-11-02 (photo/2026-11-02/102158, human holding a
+   phone showing a finch photo over an empty tray): p_bird — pplx-flash 0.164,
+   jev-1.14 0.390, mercury-decide 0.016, liquid/d1.1 0.579 (only one to call
+   bird). Picture-of-a-bird ≠ real bird is the production-correct reading
+   under the current criteria; liquid/d1.1 fails this case — deprioritized.
 
 Decision at end of Phase 3 (alt): stream probes to Pi for a real detector instead
 of on-device model — pipeline is the same either way.
