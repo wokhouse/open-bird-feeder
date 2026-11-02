@@ -45,6 +45,9 @@ export default function App() {
 
   useEffect(() => {
     reload()
+    // auto-classification lands verdicts in the background: keep the queue live
+    const t = setInterval(reload, 8000)
+    return () => clearInterval(t)
   }, [reload])
 
   const runAIBatch = async () => {

@@ -61,12 +61,26 @@ export default function FrameCard({
 
   return (
     <div className="rounded-lg border bg-card text-card-foreground shadow-sm">
-      <img
-        src={fileUrl(img.path)}
-        alt={img.path}
-        loading="lazy"
-        className="aspect-[4/3] w-full rounded-t-lg object-cover"
-      />
+      <div className="relative">
+        <img
+          src={fileUrl(img.path)}
+          alt={img.path}
+          loading="lazy"
+          className="aspect-[4/3] w-full rounded-t-lg object-cover"
+        />
+        {img.box && (
+          <div
+            title="AI bird location"
+            className="pointer-events-none absolute rounded-sm border-2 border-emerald-400 shadow-[0_0_0_1px_rgba(0,0,0,0.6)]"
+            style={{
+              left: `${img.box[0] * 100}%`,
+              top: `${img.box[1] * 100}%`,
+              width: `${(img.box[2] - img.box[0]) * 100}%`,
+              height: `${(img.box[3] - img.box[1]) * 100}%`,
+            }}
+          />
+        )}
+      </div>
       <div className="flex flex-col gap-2 p-3">
         <div className="flex flex-wrap items-center gap-2">
           {stateBadge(img)}

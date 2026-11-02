@@ -16,9 +16,11 @@ Later phase 5b replaces the motion gate with an int8 bird/no-bird classifier
 Receiver (FastAPI): stores uploads under data/<kind>/<date>/HHMMSS_<device>.jpg.
 Review UI: Vite+React+Tailwind+shadcn SPA (webui/) served from webui/dist at /.
 Classification states: unclassified / no_bird / bird_identified / species_identified,
-each row carrying provenance (manual|kimi, model, confidence, note) in ingest/labels.db.
-Kimi (Moonshot vision API, ingest/kimi.py) makes the bird/no-bird + species call;
-manual review always wins locally. Needs MOONSHOT_API_KEY in ingest/.env.
+each row carrying provenance (manual|ai, model, confidence, note, bbox) in ingest/labels.db.
+Every /upload photo is auto-reviewed in the background by an OpenAI-compatible vision
+endpoint (ingest/llm.py, LLM_* env): bird/no-bird + species + normalized bbox; the UI
+shows the box over each card and is for manual birder review. Manual review always
+wins locally. Needs LLM_API_KEY in ingest/.env.
 
 ## Hardware facts (verified this session)
 

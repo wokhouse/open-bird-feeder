@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Create venv if needed and run the ingest service (reads ingest/.env first:
-# MOONSHOT_API_KEY, KIMI_MODEL, INGEST_DATA, PORT...).
+# LLM_API_KEY, LLM_BASE_URL, LLM_MODEL, INGEST_DATA, PORT...).
 set -euo pipefail
 cd "$(dirname "$0")"
 [ -d .venv ] || { python3 -m venv .venv && .venv/bin/pip install -q -r requirements.txt; }

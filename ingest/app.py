@@ -1,10 +1,14 @@
 """open-birdhouse ingest service (runs on the laptop in dev, the Pi in prod).
 
-Upload + Kimi classification + manual review for the bird training set.
+Upload + AI classification + manual review for the bird training set.
+Every uploaded photo is auto-classified in the background by the
+OpenAI-compatible vision endpoint (llm.py): bird/no-bird, species, bounding
+box. The review UI is for human (birder) review of those AI verdicts.
 
 Image states: unclassified (no stored row) | no_bird | bird_identified |
 species_identified. Every classification carries provenance: manual vs ai,
-which model, confidence, note. Manual review always wins locally; re-running
+which model, confidence, note, and for AI verdicts a normalized bounding box
+[x1,y1,x2,y2] in 0..1. Manual review always wins locally; re-running
 AI re-runs replace the row either way in v0;
 manual-vs-AI precedence is a hardening TODO in PLAN.md).
 
@@ -12,13 +16,14 @@ Endpoints:
   POST /upload?kind=photo|probe      raw JPEG body; headers: X-Device-Id,
                                      X-Motion-Hot, X-Motion-Global and
                                      X-Motion-Grid (probe: packed hot-cell
-                                     map; stored as a .grid.json sidecar)
-  GET  /api/images                   [{path,state,species,source,confidence,note}]
+                                     map; stored as a .grid.json sidecar).
+                                     kind=photo also queues AI review.
+  GET  /api/images                   [{path,state,species,source,confidence,note,box}]
   GET  /api/stats                    counts per state
   POST /api/set_state {path,state,species?}   manual review ('unclassified' clears)
-  POST /api/classify {path}          Kimi bird/no-bird + species call, stores result
-  POST /api/classify_pending {limit} Kimi over up to N unclassified frames
-  GET  /export.csv                   path,state,species,source,confidence,note
+  POST /api/classify {path}          re-run AI on one frame, stores result
+  POST /api/classify_pending {limit} AI over up to N unclassified frames (backfill)
+  GET  /export.csv                   path,state,species,source,confidence,note,box
   /files/...                         static frames
   /                                  webui/dist if built, else API pointer
 Run:  ./run.sh   (venv + uvicorn on 0.0.0.0:$PORT default 8078; reads ingest/.env)
@@ -32,13 +37,15 @@ import sqlite3
 from pathlib import Path
 
 import llm
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
 DATA = Path(os.environ.get("INGEST_DATA", Path(__file__).parent / "data")).resolve()
 DATA.mkdir(parents=True, exist_ok=True)  # StaticFiles refuses a missing dir at mount time
-DB_PATH = Path(__file__).parent / "labels.db"  # classifications are metadata: keep in git
+# classifications are metadata: keep in git (INGEST_DB override for tests/dev)
+DB_PATH = Path(os.environ.get("INGEST_DB", Path(__file__).parent / "labels.db"))
 SAFE = lambda s: "".join(c for c in s if c.isalnum() or c in "-_.")[:48] or "unknown"
 STATES = ("no_bird", "bird_identified", "species_identified")
 
@@ -52,9 +59,18 @@ def db() -> sqlite3.Connection:
     conn.execute(
         "CREATE TABLE IF NOT EXISTS classifications("
         "path TEXT PRIMARY KEY, state TEXT NOT NULL, source TEXT NOT NULL, "
-        "species TEXT, confidence REAL, note TEXT, model TEXT, ts TEXT NOT NULL)"
+        "species TEXT, confidence REAL, note TEXT, model TEXT, box TEXT, ts TEXT NOT NULL)"
     )
     return conn
+
+
+def migrate_box_column() -> None:
+    """Add the AI bounding-box column to pre-existing DBs (runs at startup only)."""
+    conn = db()
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(classifications)")}
+    if "box" not in cols:
+        conn.execute("ALTER TABLE classifications ADD COLUMN box TEXT")
+        conn.commit()
 
 
 def migrate_v1_labels() -> None:
@@ -65,13 +81,15 @@ def migrate_v1_labels() -> None:
     for path, lab, ts in conn.execute("SELECT path,label,ts FROM labels"):
         state = "bird_identified" if lab == "bird" else "no_bird"
         conn.execute(
-            "INSERT OR IGNORE INTO classifications VALUES(?,?,?,?,?,?,?,?)",
+            "INSERT OR IGNORE INTO classifications"
+            "(path,state,source,species,confidence,note,model,ts) VALUES(?,?,?,?,?,?,?,?)",
             (path, state, "manual", None, None, None, "v1-labels-migrated", ts),
         )
     conn.execute("DROP TABLE labels")
     conn.commit()
 
 
+migrate_box_column()
 migrate_v1_labels()
 
 
@@ -106,6 +124,7 @@ def rows() -> list[dict]:
                 "source": c.get("source"),
                 "confidence": c.get("confidence"),
                 "note": c.get("note"),
+                "box": json.loads(c["box"]) if c.get("box") else None,
             }
         )
     return out
@@ -136,7 +155,7 @@ def save_motion_grid(path: Path, headers) -> None:
 
 
 @app.post("/upload")
-async def upload(request: Request, kind: str = "photo"):
+async def upload(request: Request, background_tasks: BackgroundTasks, kind: str = "photo"):
     if kind not in ("photo", "probe"):
         raise HTTPException(400, "kind must be photo|probe")
     body = await request.body()
@@ -152,22 +171,44 @@ async def upload(request: Request, kind: str = "photo"):
         path = folder / f"{ts.strftime('%H%M%S')}_{device}_{n}.jpg"
         n += 1
     path.write_bytes(body)
+    rel = str(path.relative_to(DATA))
     if kind == "probe":
         save_motion_grid(path, request.headers)
-    return {"ok": True, "path": str(path.relative_to(DATA)), "bytes": len(body)}
+    else:
+        # photos get AI review as they land; probes stay manual (they're for the
+        # future on-device model comparison, not the birder queue)
+        background_tasks.add_task(auto_classify, rel)
+    return {"ok": True, "path": rel, "bytes": len(body)}
+
+
+def auto_classify(rel: str) -> None:
+    """Background task kicked off by /upload. Sync on purpose: Starlette
+    runs it in a worker thread, so a slow AI call never stalls the device POST.
+    A failed verdict leaves the frame unclassified — 'AI bulk process' backfills."""
+    if not llm.configured():
+        print(f"[auto] {rel}: skipped, no {llm.KEY_ENV} set")
+        return
+    try:
+        verdict = llm.classify((DATA / rel).read_bytes())
+        state = apply_verdict(rel, verdict)
+        box = f" box={verdict['box']}" if verdict.get("box") else ""
+        print(f"[auto] {rel}: {state}{box}")
+    except Exception as e:
+        print(f"[auto] {rel}: AI FAILED: {e}")
 
 
 def set_row(rel: str, state: str, source: str, species=None, confidence=None,
-            note=None, model=None) -> None:
+            note=None, model=None, box=None) -> None:
     ts = now()
+    box_json = json.dumps(box) if box else None
     with db() as conn:
         conn.execute(
-            "INSERT INTO classifications(path,state,source,species,confidence,note,model,ts) "
-            "VALUES(?,?,?,?,?,?,?,?) "
-            "ON CONFLICT(path) DO UPDATE SET state=?,source=?,species=?,confidence=?,"
-            "note=?,model=?,ts=?",
-            (rel, state, source, species, confidence, note, model, ts,
-             state, source, species, confidence, note, model, ts),
+            "INSERT INTO classifications(path,state,source,species,confidence,note,model,box,ts) "
+            "VALUES(?,?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(path) DO UPDATE SET state=?,source=?,species=?,confidence=?, "
+            "note=?,model=?,box=?,ts=?",
+            (rel, state, source, species, confidence, note, model, box_json, ts,
+             state, source, species, confidence, note, model, box_json, ts),
         )
 
 
@@ -178,7 +219,8 @@ def apply_verdict(rel: str, v: dict) -> str:
         state = "species_identified"
     else:
         state = "bird_identified"
-    set_row(rel, state, "ai", v["species"], v["confidence"], v["note"], v["model"])
+    set_row(rel, state, "ai", v["species"], v["confidence"], v["note"],
+            v.get("model"), box=v.get("box"))
     return state
 
 
@@ -205,7 +247,8 @@ async def run_llm(rel: str) -> dict:
         raise HTTPException(502, f"AI not configured: set {llm.KEY_ENV} in ingest/.env")
     jpeg = (DATA / rel).read_bytes()
     try:
-        verdict = llm.classify(jpeg)
+        # llm.classify blocks on urllib: keep it off the event loop
+        verdict = await run_in_threadpool(llm.classify, jpeg)
     except Exception as e:  # upstream hiccup: surface it, never poison the store
         raise HTTPException(502, f"AI call failed: {e}")
     state = apply_verdict(rel, verdict)
@@ -247,9 +290,12 @@ def api_stats():
 def export_csv():
     buf = io.StringIO()
     w = csv.writer(buf)
-    w.writerow(["path", "state", "species", "source", "confidence", "note"])
+    fields = ["path", "state", "species", "source", "confidence", "note", "box"]
+    w.writerow(fields)
     for r in rows():  # rows() skips labels whose file is gone (e.g. trashed frames)
-        w.writerow([r[c] for c in ("path", "state", "species", "source", "confidence", "note")])
+        row = [r[c] for c in fields]
+        row[-1] = json.dumps(r["box"]) if r["box"] else ""  # one cell, parseable later
+        w.writerow(row)
     return buf.getvalue()
 
 
