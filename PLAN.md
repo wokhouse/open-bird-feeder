@@ -90,9 +90,9 @@ JEV_BIRD_P, default threshold P(bird) >= 0.5).
 5b. **On-device gating (classifier)** — train bird/no-bird on the real mounting
    scene (negatives = the actual background), flash int8 model, probe loop
    replaced by the classifier, debounce + burst capture on bird edges.
-5c. **Battery operation** — design note 2026-11-01, nothing built yet. The feeder
-   device runs from a USB-C power bank. Current firmware streams the sensor
-   continuously + keeps Wi-Fi connected: estimated 1.3-1.7 W, NOT measured
+5c. **Battery operation** — step 1 implemented 2026-11-01, steps 2-3 are design
+   notes. The feeder device runs from a USB-C power bank. Pre-d4bd059 firmware
+   (sensor streaming + always-on Wi-Fi) drew an estimated 1.3-1.7 W, NOT measured
    (Seeed board specs: Wi-Fi-on ~100 mA, light-sleep 2 mA, deep-sleep 14 uA;
    QQVGA streaming draw unknown). A 10 000 mAh bank = 37 Wh ≈ one day.
    MEASURE FIRST: charge the bank to 100%, run N hours, read the remaining %;
@@ -102,12 +102,14 @@ JEV_BIRD_P, default threshold P(bird) >= 0.5).
    from stopping the stream, not from slower polling.
    Ladder (capture quality first):
    1. Wi-Fi dial-before-call: connect only to upload. ~0.2-0.3 W saved, zero
-      capture cost. IMPLEMENTED 2026-11-01 (d4bd059): radio off while probing,
-      dialed per capture cycle; on connect failure the capture is skipped (no
-      camera mode switch for an un-uploadable photo), retries rate-limited by
-      the refractory window, stale reference frame reset (skips= counter in
-      logs). Build verified on bingbong (bin 0.96 MB, 68% app partition free).
-      FLASH + bank-gauge measurement pending — no board attached.
+      capture cost. IMPLEMENTED 2026-11-01 (d4bd059, review fixes c2dd79d):
+      radio off while probing; each capture dials once with one 8 s IP gate
+      before any encode or upload; a failed dial or missing IP skips the whole
+      cycle (no probe encode, no camera mode switch for an un-uploadable
+      photo) and the motion gate backs off exponentially (refractory <<
+      streak, cap 128 s); stale reference frame reset (skips= counter in
+      logs). Review-clean build on bingbong (bin 0.96 MB, 68% app partition
+      free). FLASH + bank-gauge measurement pending — flashing in the am.
    2. PIR wake + deep sleep (the trail-cam architecture): deep-sleep until the
       PIR fires, then run the existing probe+capture loop, idle-timeout back to
       sleep. Weeks per bank. Two hardware catches: the PIR must see the tray
