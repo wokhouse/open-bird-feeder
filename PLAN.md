@@ -256,6 +256,21 @@ JEV_BIRD_P, default threshold P(bird) >= 0.5).
    400 "topic invalid"; assemble long hex from fragments in shell, and check
    ${#VAR} for length before trusting a written identifier.
 
+6f. **Review UI: URL-pinned category + mobile tab row** — DONE + verified
+   2026-11-02 (webui): the active filter tab now syncs to the address bar as
+   ?view=<state> (replaceState on change, popstate + init read; unknown values
+   fall back to unclassified), so refresh and shared links land on the same
+   category. Verified with headless Chromium at 390x844: click species ->
+   URL ?view=species_identified, reload -> species active. The old
+   TabsList h-auto flex-wrap broke into a ragged two-row pill stack on
+   phones; replaced with one non-wrapping full-width strip
+   (overflow-x-auto overscroll-x-contain, sm:w-fit restores the compact
+   desktop pill). Edge fades (mask-image gradient driven by a
+   scroll+ResizeObserver probe) mark hidden tabs; re-run the probe on
+   document.fonts.ready — web-font swap widens the row after mount and the
+   initial update() misses it (measured pixel walk: fade absent at load,
+   present after the fonts.ready fix; docW=390=innerW, no page overflow).
+
 Decision at end of Phase 3 (alt): stream probes to Pi for a real detector instead
 of on-device model — pipeline is the same either way.
 

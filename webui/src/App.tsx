@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { RefreshCw, Sparkles } from 'lucide-react'
 import FrameCard from '@/components/FrameCard'
 import { Button } from '@/components/ui/button'
@@ -22,6 +22,20 @@ const FILTERS: { value: Filter; label: string }[] = [
   { value: 'all', label: 'all' },
 ]
 
+const FILTER_VALUES: Filter[] = FILTERS.map((f) => f.value)
+
+// keep the active tab in the URL (?view=...) so a refresh stays on the same category
+function filterFromLocation(): Filter {
+  const v = new URLSearchParams(window.location.search).get('view')
+  return FILTER_VALUES.includes(v as Filter) ? (v as Filter) : 'unclassified'
+}
+
+function writeFilterToUrl(v: Filter) {
+  const url = new URL(window.location.href)
+  url.searchParams.set('view', v)
+  window.history.replaceState(null, '', url)
+}
+
 function errMsg(e: unknown) {
   return String(e instanceof Error ? e.message : e)
 }
@@ -29,7 +43,7 @@ function errMsg(e: unknown) {
 export default function App() {
   const [images, setImages] = useState<Img[]>([])
   const [stats, setStats] = useState<Stats | null>(null)
-  const [filter, setFilter] = useState<Filter>('unclassified')
+  const [filter, setFilter] = useState<Filter>(filterFromLocation)
   const [error, setError] = useState<string | null>(null)
   const [classifying, setClassifying] = useState(false)
 
@@ -70,6 +84,38 @@ export default function App() {
     }
   }
 
+  useEffect(() => {
+    const onPop = () => setFilter(filterFromLocation())
+    window.addEventListener('popstate', onPop)
+    return () => window.removeEventListener('popstate', onPop)
+  }, [])
+
+  const tabsRef = useRef<HTMLDivElement | null>(null)
+  const [tabFade, setTabFade] = useState({ l: false, r: false })
+  useEffect(() => {
+    const el = tabsRef.current
+    if (!el) return
+    const update = () => {
+      const max = el.scrollWidth - el.clientWidth
+      setTabFade({ l: el.scrollLeft > 4, r: el.scrollLeft < max - 4 })
+    }
+    update()
+    el.addEventListener('scroll', update, { passive: true })
+    // watch the content child too: web-font swap can make the row overflow after mount
+    const ro = new ResizeObserver(update)
+    ro.observe(el)
+    const first = el.firstElementChild
+    if (first) ro.observe(first)
+    document.fonts?.ready.then(update)
+    return () => {
+      el.removeEventListener('scroll', update)
+      ro.disconnect()
+    }
+  }, [])
+  const edgeFade = `linear-gradient(90deg, ${
+    tabFade.l ? 'transparent 0, #000 16px' : '#000 0'
+  }, ${tabFade.r ? '#000 calc(100% - 16px), transparent 100%' : '#000 100%'})`
+
   const shown = (
     filter === 'all' ? images : images.filter((m) => m.state === filter)
   )
@@ -104,8 +150,12 @@ export default function App() {
         </div>
       )}
 
-      <Tabs value={filter} onValueChange={(v) => setFilter(v as Filter)}>
-        <TabsList className="mb-4 h-auto flex-wrap">
+      <Tabs value={filter} onValueChange={(v) => { const f = v as Filter; setFilter(f); writeFilterToUrl(f) }}>
+        <TabsList
+          ref={tabsRef}
+          style={{ WebkitMask: edgeFade, mask: edgeFade }}
+          className="no-scrollbar mb-4 w-full max-w-full justify-start overflow-x-auto overscroll-x-contain sm:w-fit"
+        >
           {FILTERS.map((f) => (
             <TabsTrigger key={f.value} value={f.value}>
               {f.label}
