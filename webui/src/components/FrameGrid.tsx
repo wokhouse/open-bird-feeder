@@ -28,10 +28,14 @@ export function FrameGrid({
   items,
   onChanged,
   onError,
+  selected,
+  onToggleSelect,
 }: {
   items: Img[]
   onChanged: () => void
   onError: (msg: string) => void
+  selected: Set<string>
+  onToggleSelect: (path: string, shift: boolean) => void
 }) {
   const [cols, setCols] = useState(readCols)
   useEffect(() => {
@@ -86,6 +90,8 @@ export function FrameGrid({
                 img={img}
                 onChanged={onChanged}
                 onError={onError}
+                selected={selected.has(img.path)}
+                onToggleSelect={(shift) => onToggleSelect(img.path, shift)}
               />
             ))}
           </div>

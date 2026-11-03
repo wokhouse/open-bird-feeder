@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { RefreshCw, Sparkles } from 'lucide-react'
 import { FrameGrid } from '@/components/FrameGrid'
+import SelectionBar from '@/components/SelectionBar'
 import { Button } from '@/components/ui/button'
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import {
@@ -66,15 +67,46 @@ export default function App() {
   const [sort, setSort] = useState<Sort>(sortFromLocation)
   const [error, setError] = useState<string | null>(null)
   const [classifying, setClassifying] = useState(false)
+  const [selected, setSelected] = useState<Set<string>>(new Set())
+  // index bookkeeping for shift+click range select, kept in sync with `shown`
+  const shownIndex = useRef<Map<string, number>>(new Map())
+  const shownOrder = useRef<Img[]>([])
+  const lastIndex = useRef(-1)
 
   const reload = useCallback(async () => {
     try {
       const [imgs, st] = await Promise.all([getImages(), getStats()])
       setImages(imgs)
       setStats(st)
+      // frames deleted elsewhere (device, another tab) must not haunt the bar
+      const live = new Set(imgs.map((i) => i.path))
+      setSelected((prev) =>
+        prev.size && [...prev].some((p) => !live.has(p))
+          ? new Set([...prev].filter((p) => live.has(p)))
+          : prev,
+      )
     } catch (e) {
       setError(errMsg(e))
     }
+  }, [])
+
+  const toggleSelect = useCallback((path: string, shift: boolean) => {
+    setSelected((prev) => {
+      const idx = shownIndex.current.get(path) ?? -1
+      const last = lastIndex.current
+      if (shift && idx >= 0 && last >= 0) {
+        // range select over the visible ordering; keeps prior selections
+        const next = new Set(prev)
+        const [a, b] = last <= idx ? [last, idx] : [idx, last]
+        for (let i = a; i <= b; i++) next.add(shownOrder.current[i].path)
+        return next
+      }
+      const next = new Set(prev)
+      if (next.has(path)) next.delete(path)
+      else next.add(path)
+      return next
+    })
+    lastIndex.current = shownIndex.current.get(path) ?? -1
   }, [])
 
   useEffect(() => {
@@ -160,6 +192,8 @@ export default function App() {
           return byNewest(a, b)
       }
     })
+  shownIndex.current = new Map(shown.map((img, i) => [img.path, i]))
+  shownOrder.current = shown
 
   return (
     <div className="mx-auto max-w-7xl p-4 md:p-6">
@@ -180,7 +214,7 @@ export default function App() {
       <div className="mb-4 flex flex-wrap items-center gap-2">
         <Tabs
           value={filter}
-          onValueChange={(v) => { const f = v as Filter; setFilter(f); writeUrlParam('view', f) }}
+          onValueChange={(v) => { const f = v as Filter; setFilter(f); writeUrlParam('view', f); lastIndex.current = -1 }}
           className="min-w-0 flex-1"
         >
           <TabsList
@@ -208,6 +242,7 @@ export default function App() {
               const s = e.target.value as Sort
               setSort(s)
               writeUrlParam('sort', s)
+              lastIndex.current = -1
             }}
             className="h-9 rounded-md border border-input bg-background px-2 text-sm"
           >
@@ -235,7 +270,27 @@ export default function App() {
           nothing here — frames land at /upload as the XIAO posts them.
         </p>
       ) : (
-        <FrameGrid items={shown} onChanged={reload} onError={setError} />
+        <FrameGrid
+          items={shown}
+          onChanged={reload}
+          onError={setError}
+          selected={selected}
+          onToggleSelect={toggleSelect}
+        />
+      )}
+
+      {selected.size > 0 && (
+        <SelectionBar
+          paths={[...selected]}
+          shownCount={shown.length}
+          onApplied={() => {
+            setSelected(new Set())
+            reload()
+          }}
+          onSelectAll={() => setSelected(new Set(shown.map((i) => i.path)))}
+          onClearSelection={() => setSelected(new Set())}
+          onError={setError}
+        />
       )}
     </div>
   )

@@ -58,3 +58,15 @@ export interface BatchResult {
 }
 export const classifyPending = (limit: number): Promise<BatchResult> =>
   post('/api/classify_pending', { limit })
+
+export interface BulkResult {
+  ok: boolean
+  done: number
+  failed: { path: string; error: string }[]
+}
+export const bulk = (
+  paths: string[],
+  opts: { op: 'delete' } | { op: 'set_state'; state: State; species?: string },
+): Promise<BulkResult> => post('/api/bulk', { paths, ...opts })
+export const classifyBulk = (paths: string[]): Promise<BatchResult> =>
+  post('/api/classify_bulk', { paths })

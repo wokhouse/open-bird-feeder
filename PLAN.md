@@ -305,6 +305,31 @@ JEV_BIRD_P, default threshold P(bird) >= 0.5).
    1280+390: top sort intact, bottom renders after a jump, sort switch
    re-orders, species dialog opens/closes, no overflow, zero JS errors.
 
+6j. **Bulk actions + shift+click ranges** — DONE + verified 2026-11-03:
+   Selection mode: checkbox top-left of every card (outside the img wrapper,
+   z-10, size-5); click checkbox OR the image to toggle (image click also
+   opens the label dialog — deliberate; a click on the img never reaches the
+   dialog buttons, they sit below it). Shift+click extends a range over the
+   current visible order (App keeps lastIndex + shownOrder refs; filter/sort
+   change resets the anchor; range is cumulative union). Floating
+   SelectionBar (fixed bottom, wraps; icon-only buttons below sm) with
+   count, no bird / bird / species (one shared species dialog) / clear /
+   AI (selected) / delete (2-click arm-confirm, destructive) / select all
+   filtered / clear selection. Legacy "Bulk Classify" (all pending) kept in
+   the category row. Backend: POST /api/bulk {paths, op: set_state|delete,
+   state} + POST /api/classify_bulk {paths} (skip done, cap 5000; both run
+   the existing label_write/decision_write paths so audit lines are kept).
+   /api/undo unchanged: it restores the last single operation (AI run or
+   manual edit) for the most recently operated frame; bulk sets and bulk
+   delete are not undoable. Live :8077 headless pass (Playwright):
+   shift 0..4→5 rings, extend→9, bulk no bird + API-verified state=manual,
+   bulk delete + API-verified gone (2 sacrificial upload frames), species
+   bulk via dialog, mobile 390 all bar buttons inside pill no clip, bar in
+   viewport, zero JS errors both widths. Gotcha: live camera inserts frames
+   between scripted clicks and shifts visible indices — range tests must
+   retry in a fresh page (3rd attempt clean), the app range logic itself is
+   index-consistent at click time.
+
 Decision at end of Phase 3 (alt): stream probes to Pi for a real detector instead
 of on-device model — pipeline is the same either way.
 

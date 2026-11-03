@@ -399,6 +399,62 @@ async def set_state(request: Request):
     return {"ok": True, "path": rel, "state": state, "species": species}
 
 
+@app.post("/api/bulk")
+async def bulk(request: Request):
+    """One operation over many frames in one request (selection UI).
+    op=set_state (state/species follow the /api/set_state rules) or
+    op=delete (same as /api/delete_photo: file, sidecar, all rows).
+    Per-path failures are reported, they never abort the batch."""
+    body = await request.json()
+    op = str(body.get("op", ""))
+    paths = body.get("paths")
+    if op not in ("set_state", "delete"):
+        raise HTTPException(400, "op must be set_state or delete")
+    if not isinstance(paths, list) or not paths:
+        raise HTTPException(400, "paths must be a non-empty list")
+    if len(paths) > 5000:
+        raise HTTPException(400, "too many paths (>5000)")
+    state = str(body.get("state", ""))
+    species = str(body.get("species", "") or "").strip() or None
+    if op == "set_state":
+        if state != "unclassified" and state not in STATES:
+            raise HTTPException(400, f"state must be one of {STATES + ('unclassified',)}")
+        if state == "species_identified" and not species:
+            raise HTTPException(400, "species_identified requires a species name")
+
+    done, failed = 0, []
+    with db() as conn:
+        for raw in paths:
+            try:
+                rel = safe_relpath(str(raw))
+                if op == "delete":
+                    path = DATA / rel
+                    sidecar = path.with_name(path.stem + ".grid.json")
+                    if sidecar.is_file():
+                        sidecar.unlink()
+                    path.unlink()
+                    cid = conn.execute("SELECT id FROM capture WHERE path=?", (rel,)).fetchone()
+                    if cid:
+                        conn.execute("DELETE FROM human_label WHERE capture_id=?", (cid["id"],))
+                        conn.execute("DELETE FROM verdict WHERE capture_id=?", (cid["id"],))
+                        conn.execute("DELETE FROM capture WHERE id=?", (cid["id"],))
+                elif state == "unclassified":
+                    cid = conn.execute("SELECT id FROM capture WHERE path=?", (rel,)).fetchone()
+                    if cid:
+                        conn.execute("DELETE FROM human_label WHERE capture_id=?", (cid["id"],))
+                        conn.execute("DELETE FROM verdict WHERE capture_id=?", (cid["id"],))
+                else:
+                    cid = ensure_capture(conn, rel)
+                    conn.execute(
+                        "INSERT INTO human_label(capture_id,state,species,ts) VALUES(?,?,?,?) "
+                        "ON CONFLICT(capture_id) DO UPDATE SET state=?,species=?,ts=?",
+                        (cid, state, species, now(), state, species, now()))
+                done += 1
+            except Exception as e:
+                failed.append({"path": str(raw), "error": str(e)})
+    return {"ok": True, "done": done, "failed": failed}
+
+
 async def run_ai(rel: str) -> dict:
     if not jev.configured():
         raise HTTPException(502, f"AI not configured: set {jev.KEY_ENV} in ingest/.env")
@@ -439,6 +495,31 @@ async def classify_pending(request: Request):
             return await run_ai(p)
 
     done = await asyncio.gather(*(one(p) for p in batch), return_exceptions=True)
+    results = [d for d in done if not isinstance(d, BaseException)]
+    errors = [str(d) for d in done if isinstance(d, BaseException)]
+    if not results and errors:
+        raise HTTPException(502, errors[0])
+    return {"classified": len(results), "failed": len(errors),
+            "error": errors[0] if errors else None, "results": results}
+
+
+@app.post("/api/classify_bulk")
+async def classify_bulk(request: Request):
+    """AI over explicitly selected frames (the selection bar's AI button).
+    Same concurrency and error tolerance as /api/classify_pending."""
+    body = await request.json()
+    paths = body.get("paths")
+    if not isinstance(paths, list) or not paths:
+        raise HTTPException(400, "paths must be a non-empty list")
+    if len(paths) > 500:
+        raise HTTPException(400, "too many paths (>500)")
+    sem = asyncio.Semaphore(AI_CONCURRENCY)
+
+    async def one(p: str):
+        async with sem:
+            return await run_ai(safe_relpath(str(p)))
+
+    done = await asyncio.gather(*(one(p) for p in paths), return_exceptions=True)
     results = [d for d in done if not isinstance(d, BaseException)]
     errors = [str(d) for d in done if isinstance(d, BaseException)]
     if not results and errors:

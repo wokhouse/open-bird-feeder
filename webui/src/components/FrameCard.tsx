@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { Ban, Bird, RotateCcw, Sparkles, Tag, Trash2 } from 'lucide-react'
+import { Ban, Bird, Check, RotateCcw, Sparkles, Tag, Trash2 } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import {
@@ -10,6 +10,7 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
+import { cn } from 'cn'
 import { classifyWithAI, deletePhoto, setState, type Img, type State } from '@/lib/api'
 
 export function stateBadge(img: Img) {
@@ -36,10 +37,14 @@ export default function FrameCard({
   img,
   onChanged,
   onError,
+  selected,
+  onToggleSelect,
 }: {
   img: Img
   onChanged: () => void
   onError: (msg: string) => void
+  selected: boolean
+  onToggleSelect: (shift: boolean) => void
 }) {
   const [busy, setBusy] = useState(false)
   const [speciesOpen, setSpeciesOpen] = useState(false)
@@ -67,8 +72,12 @@ export default function FrameCard({
   const mark = (state: State) => act(() => setState(img.path, state))
 
   return (
-    <div className="rounded-lg border bg-card text-card-foreground shadow-sm">
-      <div className="relative">
+    <div className={cn('rounded-lg border bg-card text-card-foreground shadow-sm', selected && 'ring-2 ring-primary')}>
+      <div
+        className="relative cursor-pointer"
+        onClick={(e) => onToggleSelect(e.shiftKey)}
+        title="Click to select / deselect; shift+click for a range"
+      >
         <img
           src={fileUrl(img.path)}
           alt={img.path}
@@ -84,6 +93,23 @@ export default function FrameCard({
             {img.taken_at.replace('T', ' ')}
           </span>
         )}
+        <button
+          type="button"
+          aria-label={selected ? 'Deselect frame' : 'Select frame'}
+          aria-pressed={selected}
+          onClick={(e) => {
+            e.stopPropagation()
+            onToggleSelect(e.shiftKey)
+          }}
+          className={cn(
+            'absolute right-1 top-1 z-10 flex size-5 items-center justify-center rounded border backdrop-blur-sm',
+            selected
+              ? 'border-primary bg-primary text-primary-foreground'
+              : 'border-white/70 bg-black/40 text-transparent hover:text-white/80',
+          )}
+        >
+          <Check className="size-3" />
+        </button>
         {img.box && (
           <div
             title="AI bird location"
