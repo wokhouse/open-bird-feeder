@@ -16,7 +16,9 @@
 // out of the box), so a brightness gate ends the day: after DARK_SUSTAIN_MS
 // of sustained darkness the device deep-sleeps and wakes every
 // NIGHT_WAKE_MS for a light check (phase 5d). Measured frame-means:
-// night 9-15, day ~135.
+// night 9-15, day ~135. The OV3660 is parked in software power-down on
+// every camera stop, so the night sleep actually draws ~1.5 mA (22-38 mA
+// unparked; tall-mule measurements ported).
 //
 // Credentials/URL live in secrets.h. Console is USB-CDC only.
 
@@ -171,8 +173,33 @@ static esp_err_t camera_start(pixformat_t format, framesize_t size, int quality,
     return ESP_OK;
 }
 
+/* Park the OV3660: SYSTEM_CTROL0 (0x3008) bit 6, the software power-down
+ * mode (the datasheet's separate "standby" mode is not what works here; bit 6
+ * is what esp32-camera#672 measured end-to-end). (esp32-camera set_reg
+ * signature: reg, mask, value — read-modify-write, preserves other bits.)
+ * Unparked the sensor keeps the whole board at 22-38 mA even during deep
+ * sleep; parked, the board measures ~1.5 mA asleep (measured on this
+ * board+sensor combo, tall-mule branch). The OV2640 (older Sense boards) has
+ * no such mode — silicon bug. Every later camera_start() runs a full
+ * esp_camera_init(), which re-probes and re-programs the sensor, so there is
+ * no unpark path; parking on every stop is what makes "park on every sleep
+ * path" true by construction, failure paths included. Must run before
+ * esp_camera_deinit(): after deinit esp_camera_sensor_get() returns NULL. */
+#define OV3660_REG_SYSTEM_CTROL0 0x3008
+#define OV3660_BIT_SW_POWERDOWN  0x40
+
+static void camera_sleep_powerdown(void)
+{
+    sensor_t *s = esp_camera_sensor_get();
+    if (s && s->id.PID == OV3660_PID) {
+        s->set_reg(s, OV3660_REG_SYSTEM_CTROL0, OV3660_BIT_SW_POWERDOWN, OV3660_BIT_SW_POWERDOWN);
+        ESP_LOGI(TAG, "ov3660 powered down (0x3008 bit6)");
+    }
+}
+
 static void camera_stop(void)
 {
+    camera_sleep_powerdown(); /* park the sensor BEFORE its handle goes away */
     esp_camera_deinit();
     vTaskDelay(pdMS_TO_TICKS(100));
 }

@@ -10,3 +10,6 @@ CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
 # Custom table: 3MB app partition (default single-app is 1MB)
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+# Night-gate light checks (5d): skip bootloader image validation on timer
+# wake (result cached in RTC memory) — shaves ~100 ms off every night wake.
+CONFIG_BOOTLOADER_SKIP_VALIDATE_IN_DEEP_SLEEP=y

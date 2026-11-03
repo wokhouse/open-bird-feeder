@@ -120,8 +120,10 @@ JEV_BIRD_P, default threshold P(bird) >= 0.5).
       solar (charge caps at 110 mA ≈ 0.4 W average). Solves the auto-off catch.
    Keep the bank inside the enclosure (cold cuts Li-ion capacity).
 5d. **Brightness gate: night deep-sleep** — code DONE, built clean on
-   bingbong 2026-11-02 (branch brightness-gate; bin 0xf9030 = 1.00 MB,
-   68% app partition free, +9.5 KB over 5c; host harness 12/12).
+   bingbong 2026-11-02 (bin 0xf9030) + on the laptop after the sensor-park
+   port (birdcam.bin 0xf9120, 68% app partition free, ~+9.6 KB over 5c;
+   host harness all-pass); FLASHED, night side VERIFIED ON BOARD 2026-11-02
+   23:34 PST (branch brightness-gate).
    Why: the Sense camera has no night
    vision out of the box (IR-cut filter, no IR illuminator), and at night
    passing cars still trip the motion gate. Measured from live captures
@@ -146,10 +148,23 @@ JEV_BIRD_P, default threshold P(bird) >= 0.5).
    clears the flag (a power-on at night re-enters after 2 min of dark
    confirmation). Camera init failure during a check sleeps on (retry next
    period) instead of spinning. Logs now carry luma= on the periodic probe
-   line; the startup line prints the gate config. TODO measured on the
-   board: dusk entry, dawn exit timing (worst-case resume delay 5 min +
-   check window), actual deep-sleep draw via the bank-gauge method in 5c,
-   and whether DARK_FRAME_MEAN=40 behaves on overcast/rain days.
+   line; the startup line prints the gate config. NIGHT SIDE MEASURED ON
+   BOARD 2026-11-02 (laptop build 0xf9120): dark detected at boot+1.6 s
+   (luma=6), night entry at dark+120 s — USB-CDC drops with the sleep —
+   timer wake at exactly +5m00s, port present 5.6 s (one full 8-frame
+   check) then re-sleep; ingest total frozen through the cycle (no more
+   black uploads). Ported from tall-mule (its duty-cycle architecture is
+   superseded by 5c, the power pieces are not): OV3660 software power-down
+   on EVERY camera_stop (must run before esp_camera_deinit, which NULLs the
+   sensor handle; ~1.5 mA asleep vs 22-38 mA) and
+   BOOTLOADER_SKIP_VALIDATE_IN_DEEP_SLEEP=y (~100 ms off every light-check
+   wake). Verify wake cycles by PORT LIFECYCLE, never by opening the port:
+   opening asserts DTR/RTS -> USB_UART_CHIP_RESET, aborting a running
+   light check and making the next boot read as cold (fresh day, night
+   flag cleared). TODO: dawn resume (owner watching upload resumption in
+   the morning), deep-sleep draw via the 5c bank-gauge method (now
+   expecting ~1.5 mA with the park), and whether DARK_FRAME_MEAN=40
+   behaves on overcast/rain days.
 6. **Pi deployment** — DONE 2026-11-01 (service part): ingest runs on sleepy (Pi, Debian 13)
    as systemd unit open-bird-feeder-ingest.service — repo at /home/fungj/repos/open-bird-feeder
    (pull from GitHub main), venv, uvicorn on 0.0.0.0:8077, Restart=on-failure. ingest/.env
