@@ -161,10 +161,23 @@ JEV_BIRD_P, default threshold P(bird) >= 0.5).
    wake). Verify wake cycles by PORT LIFECYCLE, never by opening the port:
    opening asserts DTR/RTS -> USB_UART_CHIP_RESET, aborting a running
    light check and making the next boot read as cold (fresh day, night
-   flag cleared). TODO: dawn resume (owner watching upload resumption in
-   the morning), deep-sleep draw via the 5c bank-gauge method (now
-   expecting ~1.5 mA with the park), and whether DARK_FRAME_MEAN=40
-   behaves on overcast/rain days.
+   flag cleared). DAWN SIDE MEASURED FROM INGEST 2026-11-03 (no console
+   needed: journal + capture DB): installed outdoors with this build,
+   motion captures until 00:17:08, night entry ~00:19 (dark+120 s), then
+   6h14m with ZERO uploads (00:17:08 -> 06:31:04) - the old firmware
+   posted a heartbeat at least every 15 min, so the silence is the sleep
+   proof. First motion capture 06:31:04, around sunrise, inside the
+   5-min wake budget. Rest of the day: photo/probe back 1:1, zero night
+   frames. Pre-flash waste quantified: old firmware produced 200 black
+   probe+photo cycles on car traffic 18:00-00:17 (photos later deleted
+   from the review UI; the ingest journal stands). Bank math: gauge read
+   3/4 of 5000 mAh after ~13 h of the old firmware = ~95 mA average;
+   deleting the dark hours cuts ~0.8-1.2 Ah/day down to ~9 mAh (1.5 mA
+   parked x 6 h) - expect ~2 -> ~4-5 days per charge, UNMEASURED. The
+   bank did not low-load auto-off through the sleeping night on this
+   unit. TODO: gate behaviour on overcast/rain days, the real sleep
+   draw via the 5c bank-gauge method, and an endurance run to confirm
+   the bank-life numbers.
 6. **Pi deployment** — DONE 2026-11-01 (service part): ingest runs on sleepy (Pi, Debian 13)
    as systemd unit open-bird-feeder-ingest.service — repo at /home/fungj/repos/open-bird-feeder
    (pull from GitHub main), venv, uvicorn on 0.0.0.0:8077, Restart=on-failure. ingest/.env
