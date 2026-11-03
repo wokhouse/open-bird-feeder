@@ -119,6 +119,35 @@ JEV_BIRD_P, default threshold P(bird) >= 0.5).
    3. Enclosure end-state for installers: LiPo/18650 on the BAT pads + small
       solar (charge caps at 110 mA ≈ 0.4 W average). Solves the auto-off catch.
    Keep the bank inside the enclosure (cold cuts Li-ion capacity).
+5d. **Brightness gate: night deep-sleep** — code DONE + host harness clean
+   2026-11-02 (branch brightness-gate). Why: the Sense camera has no night
+   vision out of the box (IR-cut filter, no IR illuminator), and at night
+   passing cars still trip the motion gate. Measured from live captures
+   (ingest/data/photo, 2026-11-01/02): mean frame luma 9-15 at night
+   (20:00 burst = 7 black photos in 5 min of traffic), headlight frames
+   included; ~135 in day; the 17h hour falls through both in one step.
+   The mean luma of a probe frame is therefore a light meter with a ~10x
+   margin, and needs no extra hardware: frame_mean_luma() sums every 4th
+   byte of the Y8 probe frame (4800 samples, negligible next to the
+   detector pass). Gate: sample every 20th probe frame (~3 s); DARK_FRAME_MEAN
+   = 40 separates night (max 15) from day (min ~130) with the measured
+   margins; after DARK_SUSTAIN_MS = 120 s of sustained dark samples the
+   device stops the camera and esp_deep_sleep_start()s with a 5-minute
+   timer wake (Seeed deep-sleep spec 14 uA vs ~100 mA probing — the night
+   hours are ~40% of the cycle, so this dominates the battery math).
+   Night flag lives in RTC_NOINIT_ATTR (magic 'NGT1' + check counter); a
+   boot with magic + ESP_SLEEP_WAKEUP_TIMER runs light_check() instead of
+   the probe loop: 8 frames at 500 ms, >= 5 bright (>= DARK_FRAME_MEAN)
+   resumes the day, else sleep again. Headlights at night sit under the
+   threshold, so traffic cannot end the night; a false resume (porch
+   light) re-sleeps after DARK_SUSTAIN_MS. Cold/brownout/button reset
+   clears the flag (a power-on at night re-enters after 2 min of dark
+   confirmation). Camera init failure during a check sleeps on (retry next
+   period) instead of spinning. Logs now carry luma= on the periodic probe
+   line; the startup line prints the gate config. TODO measured on the
+   board: dusk entry, dawn exit timing (worst-case resume delay 5 min +
+   check window), actual deep-sleep draw via the bank-gauge method in 5c,
+   and whether DARK_FRAME_MEAN=40 behaves on overcast/rain days.
 6. **Pi deployment** — DONE 2026-11-01 (service part): ingest runs on sleepy (Pi, Debian 13)
    as systemd unit open-bird-feeder-ingest.service — repo at /home/fungj/repos/open-bird-feeder
    (pull from GitHub main), venv, uvicorn on 0.0.0.0:8077, Restart=on-failure. ingest/.env

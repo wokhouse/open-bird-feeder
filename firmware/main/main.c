@@ -12,6 +12,11 @@
 // uploads photo + probe frame, then powers the radio down again. On dial
 // failure the whole cycle is skipped and the motion gate backs off
 // exponentially (refractory << consecutive skips, capped ~2 min).
+// At night the un-illuminated camera produces black frames (no night vision
+// out of the box), so a brightness gate ends the day: after DARK_SUSTAIN_MS
+// of sustained darkness the device deep-sleeps and wakes every
+// NIGHT_WAKE_MS for a light check (phase 5d). Measured frame-means:
+// night 9-15, day ~135.
 //
 // Credentials/URL live in secrets.h. Console is USB-CDC only.
 
@@ -26,9 +31,11 @@
 #include "esp_err.h"
 #include "esp_event.h"
 #include "esp_http_client.h"
+#include "esp_attr.h"
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_netif.h"
+#include "esp_sleep.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
 #include "img_converters.h"
@@ -76,6 +83,32 @@ static const char *TAG = "birdcam";
 #define WIFI_CONNECT_WAIT_MS 8000  /* IP budget after dialing */
 #define SKIP_BACKOFF_MAX 5         /* motion gate: refractory << skips, cap 128 s */
 #define LOG_EVERY_FRAMES 400 /* one info line per ~60 s of probing */
+
+/* Brightness gate (phase 5d). The light meter is the mean luma of a probe
+ * frame: at night the scene is unlit and frames are truly black (measured on
+ * 2026-11-01/02 captures: mean luma 9-15 at night, headlight frames
+ * included, vs ~135 in day). DARK_SUSTAIN_MS of samples under
+ * DARK_FRAME_MEAN ends the day: deep sleep, then a light check every
+ * NIGHT_WAKE_MS. The check grabs NIGHT_CHECK_FRAMES probe frames 500 ms
+ * apart and needs NIGHT_BRIGHT_FRAMES of them bright to resume; a passing
+ * car's lights at night sit far under DARK_FRAME_MEAN, so they cannot
+ * end the night. */
+#define DARK_FRAME_MEAN 40      /* frame mean below this = dark */
+#define LIGHT_SAMPLE_EVERY 20   /* measure every 20th probe frame (~3 s) */
+#define DARK_SUSTAIN_MS 120000  /* sustained darkness that ends the day */
+#define NIGHT_WAKE_MS 300000    /* deep-sleep period between light checks */
+#define NIGHT_CHECK_FRAMES 8    /* frames sampled per light check */
+#define NIGHT_CHECK_INTERVAL_MS 500
+#define NIGHT_BRIGHT_FRAMES 5   /* bright frames (of 8) that end the night */
+
+/* Survives deep sleep (RTC slow memory, uninitialized on cold boot): the
+ * magic + timer wake-up identify a "night check" boot vs a real start. */
+#define NIGHT_MAGIC 0x4e475431u /* 'NGT1' */
+typedef struct {
+    uint32_t magic;
+    uint32_t checks; /* light checks run since the night started */
+} night_state_t;
+static RTC_NOINIT_ATTR s_night;
 
 /* Cap on the hex-encoded hot-cell bitmap we put in the X-Motion-Grid header
  * (150 bytes = 1200 cells; today's grid is 480). Over-cap = no header. */
@@ -142,6 +175,57 @@ static void camera_stop(void)
 {
     esp_camera_deinit();
     vTaskDelay(pdMS_TO_TICKS(100));
+}
+
+/* Mean luma of a grayscale probe frame, sampled every 4th byte (4800
+ * samples at QQVGA, negligible next to the detector pass). -1 on a short
+ * frame. See the DARK_FRAME_MEAN block for the measured night/day gap. */
+static int frame_mean_luma(const camera_fb_t *fb)
+{
+    uint32_t sum = 0, n = 0;
+    for (size_t i = 0; i < fb->len; i += 4) { sum += fb->buf[i]; n++; }
+    return n ? (int)(sum / n) : -1;
+}
+
+/* End the day: stop the camera and deep-sleep until the next light check.
+ * The RTC state carries the night flag across the sleep; on wake the boot
+ * path in app_main() runs light_check() instead of the probe loop.
+ * Never returns. */
+static void night_sleep(void)
+{
+    camera_stop();
+    ESP_LOGI(TAG, "night: deep sleep %d ms (light check #%u)",
+             NIGHT_WAKE_MS, (unsigned)(s_night.checks + 1));
+    s_night.magic = NIGHT_MAGIC;
+    s_night.checks++;
+    vTaskDelay(pdMS_TO_TICKS(50)); /* let the console drain before the sleep */
+    esp_sleep_enable_timer_wakeup((uint64_t)NIGHT_WAKE_MS * 1000ULL);
+    esp_deep_sleep_start();
+}
+
+/* Boot right after a night deep sleep: start the camera, sample
+ * NIGHT_CHECK_FRAMES frames, count the bright ones. Returns the bright
+ * count, or -1 if the camera did not come up (stay asleep; the next timer
+ * wake tries again - sleeping through a dead camera is better than spinning
+ * without one). */
+static int light_check(void)
+{
+    if (camera_start(PROBE_PIXFORMAT, PROBE_FRAMESIZE, 0, PROBE_SETTLE) != ESP_OK)
+        return -1;
+    int bright = 0;
+    for (int i = 0; i < NIGHT_CHECK_FRAMES; i++) {
+        int luma = -1;
+        camera_fb_t *fb = esp_camera_fb_get();
+        if (fb) {
+            if (fb->len >= (size_t)fb->width * fb->height) luma = frame_mean_luma(fb);
+            esp_camera_fb_return(fb);
+        }
+        if (luma >= DARK_FRAME_MEAN) bright++;
+        ESP_LOGI(TAG, "night check %d/%d: luma=%d", i + 1, NIGHT_CHECK_FRAMES, luma);
+        vTaskDelay(pdMS_TO_TICKS(NIGHT_CHECK_INTERVAL_MS));
+    }
+    camera_stop();
+    return bright;
 }
 
 static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
@@ -421,6 +505,26 @@ void app_main(void)
     ESP_LOGI(TAG, "open-bird-feeder cam %s starting", s_device_id);
 
     ESP_ERROR_CHECK(nvs_flash_init());
+
+    /* Wake from our own night deep sleep: run exactly one light check, then
+     * sleep again or fall through into the normal day start. */
+    if (s_night.magic == NIGHT_MAGIC &&
+        esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER) {
+        ESP_LOGI(TAG, "night check after %u deep sleeps", (unsigned)s_night.checks);
+        int bright = light_check();
+        if (bright >= NIGHT_BRIGHT_FRAMES) {
+            ESP_LOGI(TAG, "dawn: %d/%d bright frames, resuming",
+                     bright, NIGHT_CHECK_FRAMES);
+            s_night.magic = 0;
+            s_night.checks = 0;
+        } else {
+            night_sleep(); /* does not return */
+        }
+    } else {
+        s_night.magic = 0; /* cold boot, brownout reset, button reset: fresh day */
+        s_night.checks = 0;
+    }
+
     wifi_init(); /* radio off until a capture dials it */
 
     while (camera_start(PROBE_PIXFORMAT, PROBE_FRAMESIZE, 0, PROBE_SETTLE) != ESP_OK) {
@@ -428,10 +532,13 @@ void app_main(void)
         vTaskDelay(pdMS_TO_TICKS(2000));
         camera_stop();
     }
-    ESP_LOGI(TAG, "probing at %.1f fps, heartbeat %d ms, wifi=dial-before-call", 1000.0f / PROBE_INTERVAL_MS, HEARTBEAT_MS);
+    ESP_LOGI(TAG, "probing at %.1f fps, heartbeat %d ms, wifi=dial-before-call, night gate: luma<%d for %d ms -> deep sleep %d ms",
+             1000.0f / PROBE_INTERVAL_MS, HEARTBEAT_MS, DARK_FRAME_MEAN, DARK_SUSTAIN_MS, NIGHT_WAKE_MS);
 
     int64_t last_capture_ms = esp_timer_get_time() / 1000;
     unsigned captures = 0, skips = 0, skip_streak = 0;
+    int64_t dark_since_ms = 0; /* 0 = not in the dark timer; start time otherwise */
+    int last_luma = -1;
 
     while (true) {
         camera_fb_t *fb = esp_camera_fb_get();
@@ -467,6 +574,34 @@ void app_main(void)
         zone_result_t r = zone_motion_update(&s_zone, fb->buf, w);
         const int64_t now_ms = esp_timer_get_time() / 1000;
         const int64_t since_ms = now_ms - last_capture_ms;
+
+        /* Brightness gate: with the day's light gone the only "motion" left
+         * is cars, and their photos are black (see DARK_FRAME_MEAN block).
+         * Count samples below the threshold; DARK_SUSTAIN_MS of sustained
+         * darkness deep-sleeps until a periodic light check. Headlight
+         * frames sit near the night floor, not above the threshold, so a
+         * passing car never clears the timer; the sun (or a porch light)
+         * does, and the timer just restarts if it goes dark again. */
+        if (s_zone.frames % LIGHT_SAMPLE_EVERY == 0) {
+            const int luma = frame_mean_luma(fb);
+            last_luma = luma;
+            if (luma >= 0) {
+                if (luma < DARK_FRAME_MEAN) {
+                    if (!dark_since_ms) {
+                        dark_since_ms = now_ms;
+                        ESP_LOGI(TAG, "dark: luma=%d < %d, watching %d ms",
+                                 luma, DARK_FRAME_MEAN, DARK_SUSTAIN_MS);
+                    } else if (now_ms - dark_since_ms >= DARK_SUSTAIN_MS) {
+                        esp_camera_fb_return(fb);
+                        fb = NULL;
+                        night_sleep(); /* does not return */
+                    }
+                } else if (dark_since_ms) {
+                    ESP_LOGI(TAG, "light returned: luma=%d", luma);
+                    dark_since_ms = 0;
+                }
+            }
+        }
 
         bool shoot = false;
         const char *why = NULL;
@@ -511,8 +646,8 @@ void app_main(void)
             wifi_power_down();
         } else {
             if (s_zone.frames % LOG_EVERY_FRAMES == 0) {
-                ESP_LOGI(TAG, "probing: frames=%u captures=%u skips=%u last hot=%d global=%d",
-                         (unsigned)s_zone.frames, captures, skips, r.hot_cells, r.global_mean);
+                ESP_LOGI(TAG, "probing: frames=%u captures=%u skips=%u luma=%d last hot=%d global=%d",
+                         (unsigned)s_zone.frames, captures, skips, last_luma, r.hot_cells, r.global_mean);
             }
             esp_camera_fb_return(fb);
         }
