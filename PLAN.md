@@ -119,8 +119,9 @@ JEV_BIRD_P, default threshold P(bird) >= 0.5).
    3. Enclosure end-state for installers: LiPo/18650 on the BAT pads + small
       solar (charge caps at 110 mA ≈ 0.4 W average). Solves the auto-off catch.
    Keep the bank inside the enclosure (cold cuts Li-ion capacity).
-5d. **Brightness gate: night deep-sleep** — code DONE + host harness clean
-   2026-11-02 (branch brightness-gate). Why: the Sense camera has no night
+5d. **Brightness gate: night deep-sleep** — code DONE, built clean on
+   bingbong 2026-11-02 (branch brightness-gate, bin 0.96 MB / 68% app
+   partition free, host harness 12/12). Why: the Sense camera has no night
    vision out of the box (IR-cut filter, no IR illuminator), and at night
    passing cars still trip the motion gate. Measured from live captures
    (ingest/data/photo, 2026-11-01/02): mean frame luma 9-15 at night

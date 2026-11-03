@@ -108,7 +108,7 @@ typedef struct {
     uint32_t magic;
     uint32_t checks; /* light checks run since the night started */
 } night_state_t;
-static RTC_NOINIT_ATTR s_night;
+static RTC_NOINIT_ATTR night_state_t s_night;
 
 /* Cap on the hex-encoded hot-cell bitmap we put in the X-Motion-Grid header
  * (150 bytes = 1200 cells; today's grid is 480). Over-cap = no header. */
