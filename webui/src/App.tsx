@@ -24,16 +24,35 @@ const FILTERS: { value: Filter; label: string }[] = [
 
 const FILTER_VALUES: Filter[] = FILTERS.map((f) => f.value)
 
-// keep the active tab in the URL (?view=...) so a refresh stays on the same category
+type Sort = 'newest' | 'oldest' | 'p_desc' | 'p_asc'
+const SORT_VALUES: Sort[] = ['newest', 'oldest', 'p_desc', 'p_asc']
+const SORTS: { value: Sort; label: string }[] = [
+  { value: 'newest', label: 'newest first' },
+  { value: 'oldest', label: 'oldest first' },
+  { value: 'p_desc', label: 'bird p: high→low' },
+  { value: 'p_asc', label: 'bird p: low→high' },
+]
+
+// active tab + sort live in the URL (?view=...&sort=...) so refresh and
+// shared links land on the same state
+function urlParam(name: string): string | null {
+  return new URLSearchParams(window.location.search).get(name)
+}
+
+function writeUrlParam(name: string, value: string) {
+  const url = new URL(window.location.href)
+  url.searchParams.set(name, value)
+  window.history.replaceState(null, '', url)
+}
+
 function filterFromLocation(): Filter {
-  const v = new URLSearchParams(window.location.search).get('view')
+  const v = urlParam('view')
   return FILTER_VALUES.includes(v as Filter) ? (v as Filter) : 'unclassified'
 }
 
-function writeFilterToUrl(v: Filter) {
-  const url = new URL(window.location.href)
-  url.searchParams.set('view', v)
-  window.history.replaceState(null, '', url)
+function sortFromLocation(): Sort {
+  const v = urlParam('sort')
+  return SORT_VALUES.includes(v as Sort) ? (v as Sort) : 'newest'
 }
 
 function errMsg(e: unknown) {
@@ -44,6 +63,7 @@ export default function App() {
   const [images, setImages] = useState<Img[]>([])
   const [stats, setStats] = useState<Stats | null>(null)
   const [filter, setFilter] = useState<Filter>(filterFromLocation)
+  const [sort, setSort] = useState<Sort>(sortFromLocation)
   const [error, setError] = useState<string | null>(null)
   const [classifying, setClassifying] = useState(false)
 
@@ -85,7 +105,10 @@ export default function App() {
   }
 
   useEffect(() => {
-    const onPop = () => setFilter(filterFromLocation())
+    const onPop = () => {
+      setFilter(filterFromLocation())
+      setSort(sortFromLocation())
+    }
     window.addEventListener('popstate', onPop)
     return () => window.removeEventListener('popstate', onPop)
   }, [])
@@ -116,11 +139,27 @@ export default function App() {
     tabFade.l ? 'transparent 0, #000 16px' : '#000 0'
   }, ${tabFade.r ? '#000 calc(100% - 16px), transparent 100%' : '#000 100%'})`
 
-  const shown = (
-    filter === 'all' ? images : images.filter((m) => m.state === filter)
-  )
+  // paths embed date+time, so their lexical order is chronological
+  const byNewest = (a: Img, b: Img) => (a.path < b.path ? 1 : a.path > b.path ? -1 : 0)
+  const shown = (filter === 'all' ? images : images.filter((m) => m.state === filter))
     .slice()
-    .reverse() // newest first (paths embed date+time)
+    .sort((a, b) => {
+      switch (sort) {
+        case 'oldest':
+          return -byNewest(a, b)
+        case 'p_desc':
+        case 'p_asc': {
+          // frames without a p (manual/legacy/unclassified) always go last
+          if (a.p_bird == null && b.p_bird == null) return byNewest(a, b)
+          if (a.p_bird == null) return 1
+          if (b.p_bird == null) return -1
+          const d = sort === 'p_desc' ? b.p_bird - a.p_bird : a.p_bird - b.p_bird
+          return d !== 0 ? d : byNewest(a, b)
+        }
+        default:
+          return byNewest(a, b)
+      }
+    })
 
   return (
     <div className="mx-auto max-w-7xl p-4 md:p-6">
@@ -134,6 +173,22 @@ export default function App() {
           </p>
         </div>
         <div className="flex gap-2">
+          <select
+            aria-label="Sort frames"
+            value={sort}
+            onChange={(e) => {
+              const s = e.target.value as Sort
+              setSort(s)
+              writeUrlParam('sort', s)
+            }}
+            className="h-9 rounded-md border border-input bg-background px-2 text-sm"
+          >
+            {SORTS.map((s) => (
+              <option key={s.value} value={s.value}>
+                {s.label}
+              </option>
+            ))}
+          </select>
           <Button onClick={runAIBatch} disabled={classifying}>
             <Sparkles className="size-4" />
             {classifying ? 'classifying…' : 'Bulk Classify'}
@@ -150,7 +205,7 @@ export default function App() {
         </div>
       )}
 
-      <Tabs value={filter} onValueChange={(v) => { const f = v as Filter; setFilter(f); writeFilterToUrl(f) }}>
+      <Tabs value={filter} onValueChange={(v) => { const f = v as Filter; setFilter(f); writeUrlParam('view', f) }}>
         <TabsList
           ref={tabsRef}
           style={{ WebkitMask: edgeFade, mask: edgeFade }}

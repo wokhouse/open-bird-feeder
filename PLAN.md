@@ -271,6 +271,19 @@ JEV_BIRD_P, default threshold P(bird) >= 0.5).
    initial update() misses it (measured pixel walk: fade absent at load,
    present after the fonts.ready fix; docW=390=innerW, no page overflow).
 
+6g. **Sort by bird probability** — DONE + verified 2026-11-02 (test server
+   :18077, real DATA/DB; live restart pending, sudo is blocked in the agent
+   sandbox): rows() adds an ADDITIVE "p_bird" key to /api/images — the raw
+   P(bird) of the newest verdict (null for manual/legacy/unclassified;
+   confidence stays the decision-confidence display parity). CSV export
+   untouched. webui: header select newest/oldest/bird p high→low/low→high,
+   persisted as ?sort= next to ?view= (same replaceState+popstate path);
+   p-less frames always sort last; cards show "p(bird) NN%" instead of the
+   old confidence %. Verified by headless Chromium: 1395/1424 rows carry p,
+   deep link ?view=all&sort=p_desc renders 15,14,13…% descending, p_asc
+   ascending, both params survive reload, all 29 p-less cards land last,
+   zero JS errors.
+
 Decision at end of Phase 3 (alt): stream probes to Pi for a real detector instead
 of on-device model — pipeline is the same either way.
 

@@ -10,6 +10,7 @@ export interface Img {
   species: string | null
   source: string | null // manual | ai (legacy rows: 'kimi')
   confidence: number | null
+  p_bird: number | null // raw P(bird) from the newest AI verdict (null: manual/legacy/unclassified)
   note: string | null
   box: [number, number, number, number] | null // AI bbox, normalized 0..1 [x1,y1,x2,y2]
   taken_at: string | null // server-local wall clock, e.g. 2026-11-01T19:27:45

@@ -213,23 +213,27 @@ def rows() -> list[dict]:
         v = latest.get(cid) if cid is not None else None
         if h:
             out.append({"path": p, "state": h["state"], "species": h["species"],
-                        "source": "manual", "confidence": None,
+                        "source": "manual", "confidence": None, "p_bird": None,
                         "note": h["note"], "box": None, "taken_at": taken})
         elif v:
             if v["p_bird"] is not None:
                 bird = v["p_bird"] >= jev.BIRD_P
                 conf = round(v["p_bird"] if bird else 1.0 - v["p_bird"], 4)
+                p_bird = round(v["p_bird"], 4)
             else:  # pre-Jev verdict: state and confidence kept verbatim
                 bird = v["state_hint"] == "bird_identified"
                 conf = v["confidence"]
+                p_bird = None
             out.append({"path": p, "state": "bird_identified" if bird else "no_bird",
                         "species": None, "source": "ai", "confidence": conf,
+                        "p_bird": p_bird,
                         "note": v["note"],
                         "box": json.loads(v["box"]) if v["box"] else None,
                         "taken_at": taken})
         else:
             out.append({"path": p, "state": "unclassified", "species": None,
-                        "source": None, "confidence": None, "note": None, "box": None,
+                        "source": None, "confidence": None, "p_bird": None,
+                        "note": None, "box": None,
                         "taken_at": taken})
     return out
 

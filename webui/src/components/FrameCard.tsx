@@ -102,8 +102,10 @@ export default function FrameCard({
           {img.source && (
             <span className="text-xs text-muted-foreground">
               via {img.source === 'kimi' || img.source === 'ai' ? 'AI' : img.source}
-              {img.confidence != null &&
-                ` · ${(img.confidence * 100).toFixed(0)}%`}
+              {img.p_bird != null
+                ? ` · p(bird) ${(img.p_bird * 100).toFixed(0)}%`
+                : img.confidence != null &&
+                  ` · ${(img.confidence * 100).toFixed(0)}%`}
             </span>
           )}
         </div>
