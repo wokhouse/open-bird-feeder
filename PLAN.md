@@ -292,6 +292,19 @@ JEV_BIRD_P, default threshold P(bird) >= 0.5).
    tabs, strip [16,374]=cards column, docW=innerW, strip still scrollable,
    sort intact, zero JS errors.
 
+6i. **Scroll performance (windowed grid)** — DONE + verified 2026-11-02:
+   FrameGrid.tsx replaces the one-big-grid render with @tanstack/react-virtual
+   useWindowVirtualizer row windowing (cols mirror sm/lg/xl breakpoints,
+   rows keyed by first frame path, dynamic row measurement, gap=GAP,
+   overscan 3). FrameCard img gains decoding="async". No user-visible
+   pagination; sort/URL/counts untouched. Measured on live :8077 (1545
+   frames), same 11-step scripted scroll, before → after: mounted cards
+   1545→40 max (20 at rest), DOM nodes 78.9k→2.8k, layout 0.96s→0.15s,
+   style recalc 0.71s→0.18s, script 6.2s→2.6s, heap 84MB→9MB, avg step
+   1195ms→513ms; image requests unchanged (108). Functional pass at
+   1280+390: top sort intact, bottom renders after a jump, sort switch
+   re-orders, species dialog opens/closes, no overflow, zero JS errors.
+
 Decision at end of Phase 3 (alt): stream probes to Pi for a real detector instead
 of on-device model — pipeline is the same either way.
 

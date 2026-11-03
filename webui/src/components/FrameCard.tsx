@@ -73,6 +73,7 @@ export default function FrameCard({
           src={fileUrl(img.path)}
           alt={img.path}
           loading="lazy"
+          decoding="async"
           className="aspect-[4/3] w-full rounded-t-lg object-cover"
         />
         {img.taken_at && (

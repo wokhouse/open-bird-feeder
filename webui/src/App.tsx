@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { RefreshCw, Sparkles } from 'lucide-react'
-import FrameCard from '@/components/FrameCard'
+import { FrameGrid } from '@/components/FrameGrid'
 import { Button } from '@/components/ui/button'
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import {
@@ -235,16 +235,7 @@ export default function App() {
           nothing here — frames land at /upload as the XIAO posts them.
         </p>
       ) : (
-        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
-          {shown.map((img) => (
-            <FrameCard
-              key={img.path}
-              img={img}
-              onChanged={reload}
-              onError={setError}
-            />
-          ))}
-        </div>
+        <FrameGrid items={shown} onChanged={reload} onError={setError} />
       )}
     </div>
   )
