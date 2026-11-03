@@ -102,13 +102,13 @@ export default function FrameCard({
             onToggleSelect(e.shiftKey)
           }}
           className={cn(
-            'absolute right-1 top-1 z-10 flex size-5 items-center justify-center rounded border backdrop-blur-sm',
+            'absolute right-1 top-1 z-10 flex size-4 items-center justify-center rounded-[4px] border backdrop-blur-sm',
             selected
               ? 'border-primary bg-primary text-primary-foreground'
               : 'border-white/70 bg-black/40 text-transparent hover:text-white/80',
           )}
         >
-          <Check className="size-3" />
+          <Check className="size-2.5" />
         </button>
         {img.box && (
           <div
