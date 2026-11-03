@@ -284,6 +284,14 @@ JEV_BIRD_P, default threshold P(bird) >= 0.5).
    ascending, both params survive reload, all 29 p-less cards land last,
    zero JS errors.
 
+6h. **Toolbar merge** — DONE + verified 2026-11-02: sort select + Bulk
+   Classify moved into the category-tab row (tabs flex-1, controls right;
+   flex-wrap puts the controls on their own line below the strip under sm).
+   Header keeps title/stats + refresh only. Live :8077 headless check:
+   desktop all controls in one band [84,120]; at 390px controls row below
+   tabs, strip [16,374]=cards column, docW=innerW, strip still scrollable,
+   sort intact, zero JS errors.
+
 Decision at end of Phase 3 (alt): stream probes to Pi for a real detector instead
 of on-device model — pipeline is the same either way.
 

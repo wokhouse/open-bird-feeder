@@ -163,7 +163,7 @@ export default function App() {
 
   return (
     <div className="mx-auto max-w-7xl p-4 md:p-6">
-      <header className="mb-4 flex flex-wrap items-center justify-between gap-3">
+      <header className="mb-3 flex flex-wrap items-center justify-between gap-3">
         <div>
           <h1 className="text-lg font-semibold">open-bird-feeder review</h1>
           <p className="text-sm text-muted-foreground">
@@ -172,7 +172,35 @@ export default function App() {
               : 'loading…'}
           </p>
         </div>
-        <div className="flex gap-2">
+        <Button variant="outline" onClick={reload} aria-label="Reload">
+          <RefreshCw className="size-4" />
+        </Button>
+      </header>
+
+      <div className="mb-4 flex flex-wrap items-center gap-2">
+        <Tabs
+          value={filter}
+          onValueChange={(v) => { const f = v as Filter; setFilter(f); writeUrlParam('view', f) }}
+          className="min-w-0 flex-1"
+        >
+          <TabsList
+            ref={tabsRef}
+            style={{ WebkitMask: edgeFade, mask: edgeFade }}
+            className="no-scrollbar w-full max-w-full justify-start overflow-x-auto overscroll-x-contain sm:w-fit"
+          >
+            {FILTERS.map((f) => (
+              <TabsTrigger key={f.value} value={f.value}>
+                {f.label}
+                {stats && f.value !== 'all' && (
+                  <span className="ml-1 text-muted-foreground">
+                    {stats[f.value as State]}
+                  </span>
+                )}
+              </TabsTrigger>
+            ))}
+          </TabsList>
+        </Tabs>
+        <div className="flex w-full flex-wrap items-center gap-2 sm:w-auto">
           <select
             aria-label="Sort frames"
             value={sort}
@@ -193,36 +221,14 @@ export default function App() {
             <Sparkles className="size-4" />
             {classifying ? 'classifying…' : 'Bulk Classify'}
           </Button>
-          <Button variant="outline" onClick={reload}>
-            <RefreshCw className="size-4" />
-          </Button>
         </div>
-      </header>
+      </div>
 
       {error && (
         <div className="mb-4 rounded-md border border-red-300 bg-red-50 p-3 text-sm text-red-800">
           {error}
         </div>
       )}
-
-      <Tabs value={filter} onValueChange={(v) => { const f = v as Filter; setFilter(f); writeUrlParam('view', f) }}>
-        <TabsList
-          ref={tabsRef}
-          style={{ WebkitMask: edgeFade, mask: edgeFade }}
-          className="no-scrollbar mb-4 w-full max-w-full justify-start overflow-x-auto overscroll-x-contain sm:w-fit"
-        >
-          {FILTERS.map((f) => (
-            <TabsTrigger key={f.value} value={f.value}>
-              {f.label}
-              {stats && f.value !== 'all' && (
-                <span className="ml-1 text-muted-foreground">
-                  {stats[f.value as State]}
-                </span>
-              )}
-            </TabsTrigger>
-          ))}
-        </TabsList>
-      </Tabs>
 
       {shown.length === 0 ? (
         <p className="py-16 text-center text-sm text-muted-foreground">
