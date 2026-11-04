@@ -173,9 +173,20 @@ JEV_BIRD_P, default threshold P(bird) >= 0.5).
    from the review UI; the ingest journal stands). Bank math: gauge read
    3/4 of 5000 mAh after ~13 h of the old firmware = ~95 mA average;
    deleting the dark hours cuts ~0.8-1.2 Ah/day down to ~9 mAh (1.5 mA
-   parked x 6 h) - expect ~2 -> ~4-5 days per charge, UNMEASURED. The
-   bank did not low-load auto-off through the sleeping night on this
-   unit. TODO: gate behaviour on overcast/rain days, the real sleep
+   parked x 6 h) - expect ~2 -> ~4-5 days per charge, UNMEASURED.
+   BANK LOW-LOAD AUTO-OFF (the night 5c step-2 catch, confirmed on the
+   second night): night 11-02->03 did NOT trip (dawn wake from ingest,
+   above). Night 11-03->04 DID: last capture 22:48, silence until
+   08:58 - sunrise 06:38 PST, and the 5-min light-check wake should
+   have resumed by ~07:00. Sleep draw (parked ~1.5 mA + 5.6 s wake
+   every 5 min, ~2-4 mA average) is far under the ~50 mA cutoff;
+   whether a bank trips is timing/bank luck, not a stable property.
+   A sleeping device cannot self-recover: with the rail down nothing
+   re-presents a load, so the 08:58 return = manual bank wake + cold
+   boot into a bright day. Fix path = 5c step 2/3 (LiPo on the Sense
+   BAT pads: no bank, no auto-off). Interim: a bank with a
+   low-current/always-on mode, or wall power overnight.
+   TODO: gate behaviour on overcast/rain days, the real sleep
    draw via the 5c bank-gauge method, and an endurance run to confirm
    the bank-life numbers.
 6. **Pi deployment** — DONE 2026-11-01 (service part): ingest runs on sleepy (Pi, Debian 13)
