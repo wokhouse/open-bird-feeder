@@ -114,6 +114,17 @@ static const char *TAG = "birdcam";
 #endif
 #define NIGHT_BRIGHT_FRAMES 5   /* bright frames (of 8) that end the night */
 
+/* Night mode (bank-load experiment, see PLAN 5d):
+ * 1 = idle wait: no deep sleep at night. The RTOS idle loop keeps a floor
+ *     load on the 5 V rail (CPU DFS-down to 80 MHz via PM_DFS_INIT_ONLY)
+ *     so the bank's low-load auto-off should never arm.
+ * 0 = deep sleep, load held only by the long light-check pulse above.
+ * The bank's trip law is unknown: the 11-02 night survived 6 h at ~2-4 mA,
+ * the 11-03 night tripped at the same average. Only field nights decide. */
+#ifndef NIGHT_NO_SLEEP
+#define NIGHT_NO_SLEEP 1
+#endif
+
 /* Survives deep sleep (RTC slow memory, uninitialized on cold boot): the
  * magic + timer wake-up identify a "night check" boot vs a real start. */
 #define NIGHT_MAGIC 0x4e475431u /* 'NGT1' */
@@ -225,20 +236,38 @@ static int frame_mean_luma(const camera_fb_t *fb)
     return n ? (int)(sum / n) : -1;
 }
 
-/* End the day: stop the camera and deep-sleep until the next light check.
- * The RTC state carries the night flag across the sleep; on wake the boot
- * path in app_main() runs light_check() instead of the probe loop.
- * Never returns. */
+/* End the day: stop the camera, then re-check for light every
+ * NIGHT_WAKE_MS until dawn. NIGHT_NO_SLEEP picks how the wait happens
+ * (see the mode block): idle in RAM keeping a floor load on the rail,
+ * or deep sleep with only the light-check pulses as load. Neither
+ * returns: the deep-sleep mode never wakes into the loop, the idle
+ * mode goes to dawn through esp_restart() into the cold-boot day path. */
+static int light_check(void);
+
 static void night_sleep(void)
 {
     camera_stop();
-    ESP_LOGI(TAG, "night: deep sleep %d ms (light check #%u)",
-             NIGHT_WAKE_MS, (unsigned)(s_night.checks + 1));
     s_night.magic = NIGHT_MAGIC;
     s_night.checks++;
+#if NIGHT_NO_SLEEP
+    ESP_LOGI(TAG, "night: idle wait (no deep sleep), light check every %d ms (check #%u)",
+             NIGHT_WAKE_MS, (unsigned)s_night.checks);
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(NIGHT_WAKE_MS));
+        int bright = light_check(); /* -1 = camera dead; keep waiting */
+        if (bright >= NIGHT_BRIGHT_FRAMES) {
+            ESP_LOGI(TAG, "dawn: %d/%d bright frames, restarting day",
+                     bright, NIGHT_BRIGHT_FRAMES);
+            esp_restart();
+        }
+    }
+#else
+    ESP_LOGI(TAG, "night: deep sleep %d ms (light check #%u)",
+             NIGHT_WAKE_MS, (unsigned)s_night.checks);
     vTaskDelay(pdMS_TO_TICKS(50)); /* let the console drain before the sleep */
     esp_sleep_enable_timer_wakeup((uint64_t)NIGHT_WAKE_MS * 1000ULL);
     esp_deep_sleep_start();
+#endif
 }
 
 /* Boot right after a night deep sleep: start the camera, sample
@@ -570,8 +599,14 @@ void app_main(void)
         vTaskDelay(pdMS_TO_TICKS(2000));
         camera_stop();
     }
-    ESP_LOGI(TAG, "probing at %.1f fps, heartbeat %d ms, wifi=dial-before-call, night gate: luma<%d for %d ms -> deep sleep %d ms",
-             1000.0f / PROBE_INTERVAL_MS, HEARTBEAT_MS, DARK_FRAME_MEAN, DARK_SUSTAIN_MS, NIGHT_WAKE_MS);
+    ESP_LOGI(TAG, "probing at %.1f fps, heartbeat %d ms, wifi=dial-before-call, night gate: luma<%d for %d ms -> %s %d ms",
+             1000.0f / PROBE_INTERVAL_MS, HEARTBEAT_MS, DARK_FRAME_MEAN, DARK_SUSTAIN_MS,
+#if NIGHT_NO_SLEEP
+             "idle wait, light check every",
+#else
+             "deep sleep",
+#endif
+             NIGHT_WAKE_MS);
 
     int64_t last_capture_ms = esp_timer_get_time() / 1000;
     unsigned captures = 0, skips = 0, skip_streak = 0;

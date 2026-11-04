@@ -202,6 +202,26 @@ JEV_BIRD_P, default threshold P(bird) >= 0.5).
    with zero parts. Verify by ingest gap again: silence all night +
    resume within 5 min of light = the hold worked; silence past dawn =
    it tripped, step the interval up.
+   FIELD ORDER (decided 2026-11-04): NIGHT_NO_SLEEP=1 FIRST. Night
+   wait becomes an idle loop (same check cadence/vote, camera parked
+   between checks, dawn -> esp_restart into the proven cold-boot day
+   path). sdkconfig.defaults gains CONFIG_PM_ENABLE +
+   CONFIG_PM_DFS_INIT_ONLY: DFS-only, idle drops the CPU to 80 MHz,
+   work bumps it back to 240; no light sleep anywhere, day behavior
+   unchanged. This puts a continuous tens-of-mA floor on the rail.
+   Why first: the two nights fit two different trip laws - a load
+   floor (her model: sustained sub-threshold = cut; night 1 survived
+   only because dawn came at 6.2 h < its timeout) or an averaging
+   window (pulse-hold could work). Under the floor law the pulse
+   variant can never win, and a no-sleep night DISAMBIGUATES: if a
+   continuous idle load still trips the bank, no firmware answer
+   exists and the LiPo decision is made for us. Cost if it works:
+   idle floor current unknown (80 MHz idle ~= tens of mA, bench +
+   bank-gauge measurement pending); if ~30 mA, ~2 days per 5000 mAh,
+   under the 3-day target - acceptable to settle the question in one
+   night. If it survives, step back to NIGHT_NO_SLEEP=0 + the 3 s
+   pulse for endurance; if it trips, hardware (LiPo/bank mode) and
+   the ladder is over.
    TODO: gate behaviour on overcast/rain days, the real sleep
    draw via the 5c bank-gauge method, and an endurance run to confirm
    the bank-life numbers.
