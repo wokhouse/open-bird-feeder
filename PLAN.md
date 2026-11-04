@@ -186,6 +186,22 @@ JEV_BIRD_P, default threshold P(bird) >= 0.5).
    boot into a bright day. Fix path = 5c step 2/3 (LiPo on the Sense
    BAT pads: no bank, no auto-off). Interim: a bank with a
    low-current/always-on mode, or wall power overnight.
+   FIRMWARE-ONLY ATTEMPT (pushed, awaiting field test): lengthen the
+   light-check window so each wake IS the load pulse the bank's trip
+   detector can see. NIGHT_CHECK_INTERVAL_MS 500 -> 3000 (8 frames now
+   span ~24 s, ~= 110 mA x 24 s / 300 s ~= 9 mA average, ~0.5 Wh/night,
+   endurance ~3 days per the measured 95 mA base). Ladder if it still
+   trips: -DNIGHT_CHECK_INTERVAL_MS=8000 (~24 mA, ~1.3 Wh). The spread
+   frames also make the dawn vote more robust than 8 samples in 4 s.
+   NOT deep-sleeping instead was considered and rejected: RTOS idle +
+   octal PSRAM sets a ~15-35 mA floor (not tunable lower), costs more
+   than the 9 mA pulse, and light sleep sits at ~2 mA = exactly the
+   band that already tripped. Rejected alternatives are recorded here
+   so they are not re-litigated. A held load on an RTC GPIO would need
+   a resistor (firmware cannot invent a current path); pulse-hold wins
+   with zero parts. Verify by ingest gap again: silence all night +
+   resume within 5 min of light = the hold worked; silence past dawn =
+   it tripped, step the interval up.
    TODO: gate behaviour on overcast/rain days, the real sleep
    draw via the 5c bank-gauge method, and an endurance run to confirm
    the bank-life numbers.

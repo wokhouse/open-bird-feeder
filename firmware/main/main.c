@@ -91,16 +91,27 @@ static const char *TAG = "birdcam";
  * 2026-11-01/02 captures: mean luma 9-15 at night, headlight frames
  * included, vs ~135 in day). DARK_SUSTAIN_MS of samples under
  * DARK_FRAME_MEAN ends the day: deep sleep, then a light check every
- * NIGHT_WAKE_MS. The check grabs NIGHT_CHECK_FRAMES probe frames 500 ms
- * apart and needs NIGHT_BRIGHT_FRAMES of them bright to resume; a passing
- * car's lights at night sit far under DARK_FRAME_MEAN, so they cannot
- * end the night. */
+ * NIGHT_WAKE_MS. The check grabs NIGHT_CHECK_FRAMES probe frames
+ * NIGHT_CHECK_INTERVAL_MS apart and needs NIGHT_BRIGHT_FRAMES of them bright
+ * to resume; a passing car's lights at night sit far under DARK_FRAME_MEAN,
+ * so they cannot end the night.
+ * The check window is ALSO the bank-load mechanism (see PLAN 5d): USB banks
+ * low-load auto-off below some mA floor, and a 5 s wake every 5 min is too
+ * short for their trip detector to see (field: 11-02 night survived, 11-03
+ * night did not, at ~2-4 mA avg either way). A longer check window raises
+ * the AVERAGE load: mA at the rail ~= camera_on_mA * window / NIGHT_WAKE_MS,
+ * camera_on ~110 mA at 5V. 8 frames at 3000 ms = ~24 s window ~= 9 mA
+ * average, ~0.5 Wh/night. If the bank still trips, step the interval up
+ * (8000 ms ~= 24 mA, ~1.3 Wh). The frames also spread in time, which makes
+ * the dawn vote more robust than 8 samples in 4 s. */
 #define DARK_FRAME_MEAN 40      /* frame mean below this = dark */
 #define LIGHT_SAMPLE_EVERY 20   /* measure every 20th probe frame (~3 s) */
 #define DARK_SUSTAIN_MS 120000  /* sustained darkness that ends the day */
 #define NIGHT_WAKE_MS 300000    /* deep-sleep period between light checks */
 #define NIGHT_CHECK_FRAMES 8    /* frames sampled per light check */
-#define NIGHT_CHECK_INTERVAL_MS 500
+#ifndef NIGHT_CHECK_INTERVAL_MS
+#define NIGHT_CHECK_INTERVAL_MS 3000 /* x frames ~= bank-load hold pulse */
+#endif
 #define NIGHT_BRIGHT_FRAMES 5   /* bright frames (of 8) that end the night */
 
 /* Survives deep sleep (RTC slow memory, uninitialized on cold boot): the
