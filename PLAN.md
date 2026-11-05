@@ -205,10 +205,13 @@ JEV_BIRD_P, default threshold P(bird) >= 0.5).
    FIELD ORDER (decided 2026-11-04): NIGHT_NO_SLEEP=1 FIRST. Night
    wait becomes an idle loop (same check cadence/vote, camera parked
    between checks, dawn -> esp_restart into the proven cold-boot day
-   path). sdkconfig.defaults gains CONFIG_PM_ENABLE +
-   CONFIG_PM_DFS_INIT_ONLY: DFS-only, idle drops the CPU to 80 MHz,
-   work bumps it back to 240; no light sleep anywhere, day behavior
-   unchanged. This puts a continuous tens-of-mA floor on the rail.
+   path). sdkconfig.defaults gains CONFIG_PM_ENABLE; IDF 5.2 has no
+   PM_DFS_INIT_ONLY Kconfig, so "DFS only" is pinned at runtime:
+   app_main holds an ESP_PM_NO_LIGHT_SLEEP lock forever and calls
+   esp_pm_configure(NULL) (default policy: max = build CPU frequency,
+   min = 80 MHz). Idle drops the CPU to 80 MHz with no light sleep
+   anywhere; day behavior unchanged, only faster. This puts a
+   continuous tens-of-mA floor on the rail.
    Why first: the two nights fit two different trip laws - a load
    floor (her model: sustained sub-threshold = cut; night 1 survived
    only because dawn came at 6.2 h < its timeout) or an averaging

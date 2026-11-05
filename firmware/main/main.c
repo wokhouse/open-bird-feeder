@@ -37,6 +37,7 @@
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_netif.h"
+#include "esp_pm.h"
 #include "esp_sleep.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
@@ -570,6 +571,18 @@ void app_main(void)
     esp_read_mac(mac, ESP_MAC_WIFI_STA);
     snprintf(s_device_id, sizeof(s_device_id), "xiao-%02x%02x%02x", mac[3], mac[4], mac[5]);
     ESP_LOGI(TAG, "open-bird-feeder cam %s starting", s_device_id);
+
+#if CONFIG_PM_ENABLE
+    /* NIGHT_NO_SLEEP night mode on IDF 5.2: no PM_DFS_INIT_ONLY Kconfig,
+     * so pin "DFS only" at runtime - a held ESP_PM_NO_LIGHT_SLEEP lock
+     * stops the idle task light-sleeping (that would drop the night floor
+     * to ~2 mA, the band that already tripped the bank). The default
+     * policy keeps max = configured CPU frequency, min = 80 MHz. */
+    esp_pm_lock_handle_t pm_no_light_sleep;
+    ESP_ERROR_CHECK(esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0, "no_light_sleep", &pm_no_light_sleep));
+    ESP_ERROR_CHECK(esp_pm_lock_acquire(pm_no_light_sleep));
+    ESP_ERROR_CHECK(esp_pm_configure(NULL));
+#endif
 
     ESP_ERROR_CHECK(nvs_flash_init());
 

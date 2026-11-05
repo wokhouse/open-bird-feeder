@@ -17,4 +17,5 @@ CONFIG_BOOTLOADER_SKIP_VALIDATE_IN_DEEP_SLEEP=y
 # scaling only, no light sleep. The RTOS idle task drops the CPU to 80 MHz;
 # any work bumps it back to 240. Day-loop behavior unchanged, only faster.
 CONFIG_PM_ENABLE=y
-CONFIG_PM_DFS_INIT_ONLY=y
+# NOTE: the IDF 5.2 "DFS only" pin is runtime, not Kconfig: app_main holds
+# an ESP_PM_NO_LIGHT_SLEEP lock forever (PM_DFS_INIT_ONLY is 5.3+).
