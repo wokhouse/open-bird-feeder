@@ -208,8 +208,11 @@ JEV_BIRD_P, default threshold P(bird) >= 0.5).
    path). sdkconfig.defaults gains CONFIG_PM_ENABLE; IDF 5.2 has no
    PM_DFS_INIT_ONLY Kconfig, so "DFS only" is pinned at runtime:
    app_main holds an ESP_PM_NO_LIGHT_SLEEP lock forever and calls
-   esp_pm_configure(NULL) (default policy: max = build CPU frequency,
-   min = 80 MHz). Idle drops the CPU to 80 MHz with no light sleep
+   esp_pm_configure(&cfg) with cfg = {max = build CPU frequency,
+   min = 80 MHz, light_sleep_enable=false}. (esp_pm_configure(NULL)
+   panics at boot on IDF 5.2 — NULL-means-defaults arrived in 5.3;
+   verified on xiao-1e85fc 2026-11-05, LoadProhibited in pm_impl.c.)
+   Idle drops the CPU to 80 MHz with no light sleep
    anywhere; day behavior unchanged, only faster. This puts a
    continuous tens-of-mA floor on the rail.
    Why first: the two nights fit two different trip laws - a load

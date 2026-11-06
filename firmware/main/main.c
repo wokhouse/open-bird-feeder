@@ -578,10 +578,19 @@ void app_main(void)
      * stops the idle task light-sleeping (that would drop the night floor
      * to ~2 mA, the band that already tripped the bank). The default
      * policy keeps max = configured CPU frequency, min = 80 MHz. */
+    /* esp_pm_configure(NULL) means "defaults" only from IDF 5.3; on 5.2 it
+     * dereferences the NULL pointer and panics at boot (verified on
+     * xiao-1e85fc 2026-11-05: LoadProhibited in pm_impl.c with the explicit
+     * tickless-idle guard). Pass the same values explicitly instead. */
+    esp_pm_config_t pm_cfg = {
+        .max_freq_mhz = CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ,
+        .min_freq_mhz = 80,
+        .light_sleep_enable = false, /* DFS only; NO_LIGHT_SLEEP lock below is belt-and-braces */
+    };
     esp_pm_lock_handle_t pm_no_light_sleep;
     ESP_ERROR_CHECK(esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0, "no_light_sleep", &pm_no_light_sleep));
     ESP_ERROR_CHECK(esp_pm_lock_acquire(pm_no_light_sleep));
-    ESP_ERROR_CHECK(esp_pm_configure(NULL));
+    ESP_ERROR_CHECK(esp_pm_configure(&pm_cfg));
 #endif
 
     ESP_ERROR_CHECK(nvs_flash_init());
