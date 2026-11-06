@@ -212,22 +212,27 @@ JEV_BIRD_P, default threshold P(bird) >= 0.5).
    min = 80 MHz, light_sleep_enable=false}. (esp_pm_configure(NULL)
    panics at boot on IDF 5.2 — NULL-means-defaults arrived in 5.3;
    verified on xiao-1e85fc 2026-11-05, LoadProhibited in pm_impl.c.)
-   Idle drops the CPU to 80 MHz with no light sleep
-   anywhere; day behavior unchanged, only faster. This puts a
-   continuous tens-of-mA floor on the rail.
-   Why first: the two nights fit two different trip laws - a load
-   floor (her model: sustained sub-threshold = cut; night 1 survived
-   only because dawn came at 6.2 h < its timeout) or an averaging
-   window (pulse-hold could work). Under the floor law the pulse
-   variant can never win, and a no-sleep night DISAMBIGUATES: if a
-   continuous idle load still trips the bank, no firmware answer
-   exists and the LiPo decision is made for us. Cost if it works:
-   idle floor current unknown (80 MHz idle ~= tens of mA, bench +
-   bank-gauge measurement pending); if ~30 mA, ~2 days per 5000 mAh,
-   under the 3-day target - acceptable to settle the question in one
-   night. If it survives, step back to NIGHT_NO_SLEEP=0 + the 3 s
-   pulse for endurance; if it trips, hardware (LiPo/bank mode) and
-   the ladder is over.
+   RESULT 2026-11-05 (NIGHT_NO_SLEEP=1 + DFS idle floor): the bank
+   tripped within MINUTES of the night gate closing. The tens-of-mA
+   80 MHz floor sits below the bank's load floor while the full day
+   loop (~100+ mA, camera streaming) survives every daylight hour:
+   the floor law holds and the threshold lies somewhere in between.
+   NEXT (decided 2026-11-05): night mode = CAPTURE GATE, not sleep.
+   Dark-sustained no longer parks the camera or sleeps anything; it
+   only suppresses motion captures + heartbeat. The probe loop keeps
+   running all night at exactly the bank-proven day load, and its
+   own light samples vote dawn (NIGHT_BRIGHT_FRAMES of
+   NIGHT_CHECK_FRAMES -> gate opens in ~24 s, no restart). ALL of
+   the low-power experiment is removed from the tree: CONFIG_PM_ENABLE
+   out of sdkconfig.defaults, no esp_pm calls, no idle-wait branch;
+   the deep-sleep variant (NIGHT_NO_SLEEP=0) stays archived behind
+   #if for the endurance step-back. Fixed 240 MHz day and night
+   (verified: no CONFIG_PM_ENABLE in generated sdkconfig.h, -6 KB).
+   Cost: night ~= day draw, ~1-2 Ah per night = a bank charge every
+   day or two. That is the price of settling the trip law in one
+   night: if the bank STILL sleeps under full day load, the law is
+   not load-based and the answer is hardware (LiPo/bank mode) - the
+   ladder is over either way.
    TODO: gate behaviour on overcast/rain days, the real sleep
    draw via the 5c bank-gauge method, and an endurance run to confirm
    the bank-life numbers.

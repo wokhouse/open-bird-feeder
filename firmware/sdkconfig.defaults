@@ -13,9 +13,3 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 # Night-gate light checks (5d): skip bootloader image validation on timer
 # wake (result cached in RTC memory) — shaves ~100 ms off every night wake.
 CONFIG_BOOTLOADER_SKIP_VALIDATE_IN_DEEP_SLEEP=y
-# Night without deep sleep (5d bank-load experiment): dynamic frequency
-# scaling only, no light sleep. The RTOS idle task drops the CPU to 80 MHz;
-# any work bumps it back to 240. Day-loop behavior unchanged, only faster.
-CONFIG_PM_ENABLE=y
-# NOTE: the IDF 5.2 "DFS only" pin is runtime, not Kconfig: app_main holds
-# an ESP_PM_NO_LIGHT_SLEEP lock forever (PM_DFS_INIT_ONLY is 5.3+).

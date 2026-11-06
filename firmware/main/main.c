@@ -37,7 +37,6 @@
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_netif.h"
-#include "esp_pm.h"
 #include "esp_sleep.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
@@ -116,12 +115,14 @@ static const char *TAG = "birdcam";
 #define NIGHT_BRIGHT_FRAMES 5   /* bright frames (of 8) that end the night */
 
 /* Night mode (bank-load experiment, see PLAN 5d):
- * 1 = idle wait: no deep sleep at night. The RTOS idle loop keeps a floor
- *     load on the 5 V rail (CPU DFS-down to 80 MHz via PM_DFS_INIT_ONLY)
- *     so the bank's low-load auto-off should never arm.
- * 0 = deep sleep, load held only by the long light-check pulse above.
- * The bank's trip law is unknown: the 11-02 night survived 6 h at ~2-4 mA,
- * the 11-03 night tripped at the same average. Only field nights decide. */
+ * 1 = no sleep at night: the capture gate closes but the probe loop (and
+ *     with it the OV3660 stream, PSRAM, and CPU) keeps running at DAY load.
+ *     Field result 2026-11-05: the bank slept within minutes of the idle-wait
+ *     floor (camera parked, CPU at 80 MHz), while it survives every full day
+ *     of probing — so the proven-against-trip load is the day loop itself.
+ *     Dawn is re-opened by the in-loop light samples (see DAWN VOTE below);
+ *     no light_check cycle or restart is needed.
+ * 0 = deep sleep, load held only by the long light-check pulse above. */
 #ifndef NIGHT_NO_SLEEP
 #define NIGHT_NO_SLEEP 1
 #endif
@@ -237,12 +238,13 @@ static int frame_mean_luma(const camera_fb_t *fb)
     return n ? (int)(sum / n) : -1;
 }
 
-/* End the day: stop the camera, then re-check for light every
- * NIGHT_WAKE_MS until dawn. NIGHT_NO_SLEEP picks how the wait happens
- * (see the mode block): idle in RAM keeping a floor load on the rail,
- * or deep sleep with only the light-check pulses as load. Neither
- * returns: the deep-sleep mode never wakes into the loop, the idle
- * mode goes to dawn through esp_restart() into the cold-boot day path. */
+#if !NIGHT_NO_SLEEP
+/* Deep-sleep night mode (NIGHT_NO_SLEEP=0) only: stop the camera, sleep
+ * NIGHT_WAKE_MS, and let the boot path run one light check per wake.
+ * The 5d idle-wait variant that lived here was removed 2026-11-05: its
+ * 80 MHz DFS floor tripped the bank in minutes, while the day loop
+ * survives all day - mode 1 now stays in the day loop behind the
+ * capture gate instead. Neither path returns. */
 static int light_check(void);
 
 static void night_sleep(void)
@@ -250,25 +252,11 @@ static void night_sleep(void)
     camera_stop();
     s_night.magic = NIGHT_MAGIC;
     s_night.checks++;
-#if NIGHT_NO_SLEEP
-    ESP_LOGI(TAG, "night: idle wait (no deep sleep), light check every %d ms (check #%u)",
-             NIGHT_WAKE_MS, (unsigned)s_night.checks);
-    for (;;) {
-        vTaskDelay(pdMS_TO_TICKS(NIGHT_WAKE_MS));
-        int bright = light_check(); /* -1 = camera dead; keep waiting */
-        if (bright >= NIGHT_BRIGHT_FRAMES) {
-            ESP_LOGI(TAG, "dawn: %d/%d bright frames, restarting day",
-                     bright, NIGHT_BRIGHT_FRAMES);
-            esp_restart();
-        }
-    }
-#else
     ESP_LOGI(TAG, "night: deep sleep %d ms (light check #%u)",
              NIGHT_WAKE_MS, (unsigned)s_night.checks);
     vTaskDelay(pdMS_TO_TICKS(50)); /* let the console drain before the sleep */
     esp_sleep_enable_timer_wakeup((uint64_t)NIGHT_WAKE_MS * 1000ULL);
     esp_deep_sleep_start();
-#endif
 }
 
 /* Boot right after a night deep sleep: start the camera, sample
@@ -295,6 +283,7 @@ static int light_check(void)
     camera_stop();
     return bright;
 }
+#endif /* deep-sleep night mode (NIGHT_NO_SLEEP=0) */
 
 static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
@@ -571,32 +560,17 @@ void app_main(void)
     esp_read_mac(mac, ESP_MAC_WIFI_STA);
     snprintf(s_device_id, sizeof(s_device_id), "xiao-%02x%02x%02x", mac[3], mac[4], mac[5]);
     ESP_LOGI(TAG, "open-bird-feeder cam %s starting", s_device_id);
-
-#if CONFIG_PM_ENABLE
-    /* NIGHT_NO_SLEEP night mode on IDF 5.2: no PM_DFS_INIT_ONLY Kconfig,
-     * so pin "DFS only" at runtime - a held ESP_PM_NO_LIGHT_SLEEP lock
-     * stops the idle task light-sleeping (that would drop the night floor
-     * to ~2 mA, the band that already tripped the bank). The default
-     * policy keeps max = configured CPU frequency, min = 80 MHz. */
-    /* esp_pm_configure(NULL) means "defaults" only from IDF 5.3; on 5.2 it
-     * dereferences the NULL pointer and panics at boot (verified on
-     * xiao-1e85fc 2026-11-05: LoadProhibited in pm_impl.c with the explicit
-     * tickless-idle guard). Pass the same values explicitly instead. */
-    esp_pm_config_t pm_cfg = {
-        .max_freq_mhz = CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ,
-        .min_freq_mhz = 80,
-        .light_sleep_enable = false, /* DFS only; NO_LIGHT_SLEEP lock below is belt-and-braces */
-    };
-    esp_pm_lock_handle_t pm_no_light_sleep;
-    ESP_ERROR_CHECK(esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0, "no_light_sleep", &pm_no_light_sleep));
-    ESP_ERROR_CHECK(esp_pm_lock_acquire(pm_no_light_sleep));
-    ESP_ERROR_CHECK(esp_pm_configure(&pm_cfg));
-#endif
+    /* No PM here on purpose. The 5d DFS-only low-power experiment (CPU
+     * downclock to 80 MHz at idle) tripped the bank in minutes on
+     * 2026-11-05, while the full day-loop load survives all day - so
+     * night mode runs the same full-speed loop. Fixed 240 MHz. */
 
     ESP_ERROR_CHECK(nvs_flash_init());
 
-    /* Wake from our own night deep sleep: run exactly one light check, then
-     * sleep again or fall through into the normal day start. */
+    /* Wake from our own night deep sleep (deep-sleep night mode only): run
+     * exactly one light check, then sleep again or fall through into the
+     * normal day start. */
+#if !NIGHT_NO_SLEEP
     if (s_night.magic == NIGHT_MAGIC &&
         esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER) {
         ESP_LOGI(TAG, "night check after %u deep sleeps", (unsigned)s_night.checks);
@@ -609,7 +583,9 @@ void app_main(void)
         } else {
             night_sleep(); /* does not return */
         }
-    } else {
+    } else
+#endif
+    {
         s_night.magic = 0; /* cold boot, brownout reset, button reset: fresh day */
         s_night.checks = 0;
     }
@@ -621,18 +597,20 @@ void app_main(void)
         vTaskDelay(pdMS_TO_TICKS(2000));
         camera_stop();
     }
-    ESP_LOGI(TAG, "probing at %.1f fps, heartbeat %d ms, wifi=dial-before-call, night gate: luma<%d for %d ms -> %s %d ms",
-             1000.0f / PROBE_INTERVAL_MS, HEARTBEAT_MS, DARK_FRAME_MEAN, DARK_SUSTAIN_MS,
 #if NIGHT_NO_SLEEP
-             "idle wait, light check every",
+    ESP_LOGI(TAG, "probing at %.1f fps, heartbeat %d ms, wifi=dial-before-call, night gate: luma<%d for %d ms -> capture gate (camera stays on), dawn vote %d/%d bright",
+             1000.0f / PROBE_INTERVAL_MS, HEARTBEAT_MS, DARK_FRAME_MEAN, DARK_SUSTAIN_MS,
+             NIGHT_BRIGHT_FRAMES, NIGHT_CHECK_FRAMES);
 #else
-             "deep sleep",
-#endif
+    ESP_LOGI(TAG, "probing at %.1f fps, heartbeat %d ms, wifi=dial-before-call, night gate: luma<%d for %d ms -> deep sleep %d ms",
+             1000.0f / PROBE_INTERVAL_MS, HEARTBEAT_MS, DARK_FRAME_MEAN, DARK_SUSTAIN_MS,
              NIGHT_WAKE_MS);
+#endif
 
     int64_t last_capture_ms = esp_timer_get_time() / 1000;
     unsigned captures = 0, skips = 0, skip_streak = 0;
     int64_t dark_since_ms = 0; /* 0 = not in the dark timer; start time otherwise */
+    unsigned dawn_votes = 0, dawn_samples = 0; /* gate closed: last 8 light samples */
     int last_luma = -1;
 
     while (true) {
@@ -681,15 +659,41 @@ void app_main(void)
             const int luma = frame_mean_luma(fb);
             last_luma = luma;
             if (luma >= 0) {
-                if (luma < DARK_FRAME_MEAN) {
+                const bool bright = luma >= DARK_FRAME_MEAN;
+                if (s_night.magic == NIGHT_MAGIC) {
+                    /* DAWN VOTE: gate closed. Each sample is one bit of an
+                     * 8-sample window; NIGHT_BRIGHT_FRAMES of them re-open
+                     * the gate. Headlight frames sit near the night floor,
+                     * so a passing car cannot win this vote. */
+                    dawn_votes = ((dawn_votes << 1) | (unsigned)bright) & 0xFFu;
+                    if (dawn_samples < NIGHT_CHECK_FRAMES) dawn_samples++;
+                    if (__builtin_popcount(dawn_votes &
+                            ((1u << dawn_samples) - 1u)) >= NIGHT_BRIGHT_FRAMES) {
+                        s_night.magic = 0;
+                        s_night.checks = 0;
+                        dawn_votes = 0; dawn_samples = 0; dark_since_ms = 0;
+                        ESP_LOGI(TAG, "dawn: capture gate open again, luma=%d", luma);
+                    }
+                } else if (!bright) {
                     if (!dark_since_ms) {
                         dark_since_ms = now_ms;
                         ESP_LOGI(TAG, "dark: luma=%d < %d, watching %d ms",
                                  luma, DARK_FRAME_MEAN, DARK_SUSTAIN_MS);
                     } else if (now_ms - dark_since_ms >= DARK_SUSTAIN_MS) {
+#if NIGHT_NO_SLEEP
+                        /* Not a sleep: close the capture gate only. The
+                         * probe loop keeps streaming - that IS the load the
+                         * bank survives every day. */
+                        s_night.magic = NIGHT_MAGIC;
+                        s_night.checks = 0;
+                        dawn_votes = 0; dawn_samples = 0;
+                        dark_since_ms = 0;
+                        ESP_LOGI(TAG, "night: capture gate closed, camera stays on (day load for bank)");
+#else
                         esp_camera_fb_return(fb);
                         fb = NULL;
                         night_sleep(); /* does not return */
+#endif
                     }
                 } else if (dark_since_ms) {
                     ESP_LOGI(TAG, "light returned: luma=%d", luma);
@@ -706,12 +710,18 @@ void app_main(void)
          * HEARTBEAT_MS, not by this. */
         const int backoff_exp = (int)skip_streak > SKIP_BACKOFF_MAX ? SKIP_BACKOFF_MAX : (int)skip_streak;
         const int64_t motion_gap_ms = (int64_t)REFRACTORY_MS << backoff_exp;
-        if (r.trigger && since_ms >= motion_gap_ms) {
-            shoot = true;
-            why = "motion";
-        } else if (HEARTBEAT_MS > 0 && since_ms >= HEARTBEAT_MS) {
-            shoot = true;
-            why = "heartbeat";
+        if (s_night.magic != NIGHT_MAGIC) {
+            /* Night capture gate (NIGHT_NO_SLEEP): motion triggers and the
+             * heartbeat are suppressed while closed; probing continues so
+             * the rail load stays at day level and the dawn vote keeps
+             * sampling. */
+            if (r.trigger && since_ms >= motion_gap_ms) {
+                shoot = true;
+                why = "motion";
+            } else if (HEARTBEAT_MS > 0 && since_ms >= HEARTBEAT_MS) {
+                shoot = true;
+                why = "heartbeat";
+            }
         }
 
         if (shoot) {
