@@ -196,6 +196,34 @@ JEV_BIRD_P, default threshold P(bird) >= 0.5).
        park/keeper lines, zero wake noise, duty=100%, captures still
        uploading, zero faults. Daytime draw is now ~130 mA at 5 V by
        design; the bank, not the firmware, remains the constraint.
+       (The night path was NOT gated as of this step — fixed in 1f.)
+   1f. Pre-merge review cleanup (4-reviewer fan-out, 2026-11-08):
+       applied, behavior-preserving: the night luma state-machine is now
+       gated on can_window (it previously ran and logged "night:
+       bank-keeper on"/"dawn detected" claims even with the flag=1
+       build, contradicting 1e); the hold decision is one named source
+       (HOLD_REASON: night|duty-floor|hot|no-park) consulted at both
+       decision points, replacing the duplicated De-Morgan'd predicate
+       and the half-running window churn under flag=1; the probing
+       gauge now includes the open mode segment (duty= was stale during
+       long holds — wrong exactly when keepers act) and logs hold=<reason>
+       instead of keeper=0/1, so the field can see WHICH hold is active;
+       shared helpers replace three copies of the probe-restart loop and
+       two same-value settle macros (now_ms(), discard_frames(),
+       PROBE_SETTLE); clock snapshots renamed for honesty
+       (loop_start_ms/frame_ms/iter_end_ms — they are deliberately
+       different: uploads consume seconds); misleading comments fixed
+       (night luma is whole-frame mean NOT zone mean; ~50s claim was
+       mode-dependent ~4.5-35 s; "20s-30s" was luma values).
+       Deferred to a post-merge follow-up (verified behavior, don't
+       disturb pre-merge): the day duty-floor has no steady state with
+       current knobs — windowed duty ≈28% < 45% floor means HOLD/RESUME
+       oscillation every ~70-90 s in a flag=0 build (reviewer simulated
+       the fixed-point loop; matches the 84s→287s→320s desk pattern);
+       duty_ema integer folds truncate; unify the three latches into one
+       per-iteration mode decision; SCCB park-failure fallback; the
+       windows= counter mixes two window kinds. Re-run 5c-1b desk
+       verification before ever setting the flag to 0.
    2. PIR wake + deep sleep (the trail-cam architecture): deep-sleep until the
       PIR fires, then run the existing probe+capture loop, idle-timeout back to
       sleep. Weeks per bank. Two hardware catches: the PIR must see the tray
