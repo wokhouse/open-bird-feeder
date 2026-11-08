@@ -106,6 +106,15 @@ static const char *TAG = "birdcam";
 #define NIGHT_LUMA_EXIT    60   /* any frame at/above this resumes windowing */
 #define NIGHT_DARK_FRAMES  30   /* ~50 s of window frames before declaring night */
 
+/* Field reality (2026-11-08): this pole's power bank still trips its
+ * low-load cutoff even with the duty floor below — it wants continuous
+ * load. Set to 1: the camera sensor is NEVER parked, all day. Every
+ * other power optimization (dial-before-call, capture pipeline, and the
+ * whole windowed-idle machinery for a friendlier bank) stays compiled
+ * and armed; only sensor parking is suppressed. Set to 0 if a bank
+ * without a low-load auto-off is fitted, and windowed idle returns. */
+#define INCREASE_POWER_CONSUMPTION 1
+
 /* Bank-keeper duty floor: a cold windowed DAY sinks average draw under the
  * same bank low-load cutoff as the night idle (field report 2026-11-07:
  * daytime trips the bank too). Streaming duty is tracked with an EMA
@@ -519,7 +528,7 @@ void app_main(void)
 
     /* Windowed idle state (see PROBE_IDLE_MS). Duty accounting is the field
      * power gauge: active = sensor streaming, parked = sensor standby. */
-    bool can_window = true, parked = false, mode_active = true, night = false;
+    bool can_window = !INCREASE_POWER_CONSUMPTION, parked = false, mode_active = true, night = false;
     bool bank_hold = false;
     int window_left = 0, dark_run = 0;
     int64_t hot_until_ms = 0, park_until_ms = 0;
@@ -692,7 +701,7 @@ void app_main(void)
          * hysteresis, so a cold idle never sits under the bank cutoff.
          * duty_ema is scaled so 256 = 100%; thresholds are percent*2.56. */
         uint32_t dema = duty_ema_advance(duty_ema, mode_active, p_ms - mode_since_ms);
-        if (!bank_hold && dema < (uint32_t)(MIN_DUTY_PCT * 256 / 100)) {
+        if (can_window && !bank_hold && dema < (uint32_t)(MIN_DUTY_PCT * 256 / 100)) {
             bank_hold = true;
             ESP_LOGI(TAG, "bank keeper: duty %u%% under floor %d%%, holding continuous",
                      (unsigned)(dema * 100 / 256), MIN_DUTY_PCT);

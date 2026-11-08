@@ -181,6 +181,21 @@ JEV_BIRD_P, default threshold P(bird) >= 0.5).
         close to the pre-5c draw — keeping a low-load-tripping bank awake
         costs that; the zero-waste alternative stays a bank with a
         low-current keep-on mode (or no auto-off at all).
+   1e. INCREASE_POWER_CONSUMPTION compile flag: IMPLEMENTED + verified
+       2026-11-08. The field answer beat more tuning: this pole's bank
+       STILL tripped at the 45% duty floor. The flag (default 1 for this
+       bank) means the sensor is NEVER parked — no windowing, no keeper
+       logic fires; plain continuous probe, i.e. the pre-5c load that
+       always kept banks awake. All other power work (dial-before-call,
+       capture pipeline) stays on, and the whole windowed/keeper
+       machinery stays compiled and armed: set the flag to 0 when a
+       bank without low-load auto-off is fitted and the savings return.
+       User asked for maximum simplicity — one flag, one line disables
+       the parking path (can_window init), keeper trigger gated on
+       can_window so its logs go silent too. Verified on-device: zero
+       park/keeper lines, zero wake noise, duty=100%, captures still
+       uploading, zero faults. Daytime draw is now ~130 mA at 5 V by
+       design; the bank, not the firmware, remains the constraint.
    2. PIR wake + deep sleep (the trail-cam architecture): deep-sleep until the
       PIR fires, then run the existing probe+capture loop, idle-timeout back to
       sleep. Weeks per bank. Two hardware catches: the PIR must see the tray
