@@ -224,6 +224,40 @@ JEV_BIRD_P, default threshold P(bird) >= 0.5).
        per-iteration mode decision; SCCB park-failure fallback; the
        windows= counter mixes two window kinds. Re-run 5c-1b desk
        verification before ever setting the flag to 0.
+       -> ALL FIVE ADDRESSED IN 1g (branch flag0-power-followups).
+   1g. Flag=0 follow-ups: IMPLEMENTED + desk-verified 2026-11-08.
+       (1) Duty math moved to Q16 (DUTY_SCALE/DUTY_SCALED/DUTY_PCT
+       macros, scale 65536=100%): Q8 folds of real 150-1500 ms segments
+       truncated asymmetrically, so the old controller drifted below its
+       own math. Proof of accuracy: on-device release fired at exactly
+       the computed 55% (t=67.7 s; host sim of the exact integer loop
+       predicted 66 s) and re-latch at 44%.
+       (2) Steady-state precheck: window ceiling duty =
+       (PROBE_SETTLE+WINDOW_FRAMES)*PROBE_INTERVAL_MS / (that +
+       PROBE_IDLE_MS) is computed once at boot. If the ceiling is under
+       MIN_DUTY_PCT (it is: 28% vs 45% with shipped knobs), releasing
+       bank_hold only re-latches a minute later — so the keeper latches
+       ONCE and holds continuous until reboot, with a log naming the
+       ceiling and the retune needed. The ~70-90 s oscillation cannot
+       happen anymore.
+       (3) 'parked' is now the ONE sensor-state flag: mode_active
+       deleted, MODE_CLOSE() folds the gauge/EMA before every parked
+       mutation (no second flag to desync).
+       (4) Degraded SCCB: 3 consecutive set_reg park failures =>
+       windowing off with ONE error log (was: warn every ~2 s forever
+       + re-init storm); continuous streaming is the fallback.
+       (5) windows= counts every detection-window open (unpark AND
+       hot-expiry resume) — detection duty gauge, not park cycles.
+       On-device test build (NOT shipped: flag=0, PROBE_IDLE_MS=400,
+       LOG_EVERY_FRAMES=100): boot hold -> release at 55% -> windowing
+       ran (windows 1->135, wake FB-SIZE noise normal, 4 captures
+       uploaded, zero park/unpark/grab faults) -> one margin-cycle
+       re-latch at 44% -> released again at 55%. Lesson for any real
+       flag=0 deploy: bench window cycles run ~1.0-1.5 s wall (SCCB
+       wake + 100 ms wait granularity), so measured window duty lands
+       near the floor with IDLE=400 — pick PROBE_IDLE_MS so the FIELD
+       'probing:' duty sits clearly above MIN_DUTY_PCT, else keep
+       flag=1. Board returned to the shipped flag=1 build and re-flashed.
    2. PIR wake + deep sleep (the trail-cam architecture): deep-sleep until the
       PIR fires, then run the existing probe+capture loop, idle-timeout back to
       sleep. Weeks per bank. Two hardware catches: the PIR must see the tray

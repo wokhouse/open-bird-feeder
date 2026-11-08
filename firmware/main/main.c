@@ -127,13 +127,22 @@ static const char *TAG = "birdcam";
  * windowed DAY sinks average draw under the
  * same bank low-load cutoff as the night idle (field report 2026-11-07:
  * daytime trips the bank too). Streaming duty is tracked with an EMA
- * (scaled 256 = 100%) on the bank's trip timescale; below the floor,
+ * (fixed-point, DUTY_SCALE = 100%) on the bank's trip timescale; below the floor,
  * parking is skipped (continuous probe) until duty recovers with
  * hysteresis. Busy scenes clear the floor by themselves and still get
  * full windowed savings. Field-tuning knob: MIN_DUTY_PCT. */
 #define MIN_DUTY_PCT   45      /* hold streaming duty at/above this while idle */
 #define DUTY_HYST_PCT  10      /* windowing resumes at MIN+HYST */
 #define DUTY_TAU_MS    120000  /* bank cutoff timers are minutes, not seconds */
+
+/* Fixed-point duty arithmetic. Scale is 65536 = 100% (Q16): at Q8 the
+ * realistic 150-1500 ms segment folds truncate toward zero ASYMMETRICALLY
+ * and the controller drifts below its own math (field-caught once, PLAN
+ * 5c-1d); at Q16 even a single 150 ms frame fold carries exact units.
+ * Never hand-write these conversions at a call site. */
+#define DUTY_SCALE       65536u
+#define DUTY_SCALED(pct) ((uint32_t)(((uint64_t)(pct) * DUTY_SCALE) / 100))
+#define DUTY_PCT(ema)    ((unsigned)(((uint64_t)(ema) * 100) / DUTY_SCALE))
 
 /* Cap on the hex-encoded hot-cell bitmap we put in the X-Motion-Grid header
  * (150 bytes = 1200 cells; today's grid is 480). Over-cap = no header. */
@@ -219,15 +228,16 @@ static void camera_stop(void)
     vTaskDelay(pdMS_TO_TICKS(100));
 }
 
-/* Fold a closed streaming-duty segment into the bank-keeper EMA (scaled
- * 256 = 100%, time constant DUTY_TAU_MS). Segments longer than the time
- * constant saturate the estimate — exact math is pointless past that. */
+/* Fold a closed streaming-duty segment into the bank-keeper EMA (scale:
+ * DUTY_SCALE = 100%, time constant DUTY_TAU_MS). Segments longer than the
+ * time constant saturate the estimate — exact math is pointless past that. */
 static uint32_t duty_ema_advance(uint32_t ema, bool active, int64_t elapsed_ms)
 {
     if (elapsed_ms <= 0) return ema;
-    if (elapsed_ms >= DUTY_TAU_MS) return active ? 256 : 0;
-    if (active) return ema + (uint32_t)(((uint64_t)(256 - ema) * elapsed_ms) / DUTY_TAU_MS);
-    return ema - (uint32_t)(((uint64_t)ema * elapsed_ms) / DUTY_TAU_MS);
+    if (elapsed_ms >= DUTY_TAU_MS) return active ? DUTY_SCALE : 0;
+    uint64_t fold = (uint64_t)(active ? DUTY_SCALE - ema : ema)
+                    * (uint64_t)elapsed_ms / DUTY_TAU_MS;
+    return active ? (uint32_t)(ema + fold) : (uint32_t)(ema - fold);
 }
 
 /* Absolute scene luma for the night bank-keeper: zone_result_t.global_mean is
@@ -559,24 +569,42 @@ void app_main(void)
     unsigned captures = 0, skips = 0, skip_streak = 0;
 
     /* Windowed idle state (see PROBE_IDLE_MS). Duty accounting is the field
-     * power gauge: active = sensor streaming, parked = sensor standby. */
-    bool can_window = !INCREASE_POWER_CONSUMPTION, parked = false, mode_active = true, night = false;
+     * power gauge: active = sensor streaming, parked = sensor standby.
+     * 'parked' is the ONE sensor-state flag — the gauge derives streaming
+     * from it; never cache a second copy of that fact. */
+    bool can_window = !INCREASE_POWER_CONSUMPTION, parked = false, night = false;
     bool bank_hold = false;
-    int window_left = 0, dark_run = 0;
+    int window_left = 0, dark_run = 0, park_fails = 0;
     int64_t hot_until_ms = 0, park_until_ms = 0;
     int64_t mode_since_ms = now_ms();
     uint32_t windows = 0;
-    uint32_t duty_ema = 0; /* scaled 256=100%; starts at 0 = keeper engaged at boot */
+    uint32_t duty_ema = 0; /* scale DUTY_SCALE=100%; starts at 0 = keeper engaged at boot */
     uint64_t active_ms = 0, parked_ms = 0;
-#define MODE_TO(active) do {                                          \
-        if (mode_active != (active)) {                                \
-            int64_t t_ = now_ms();                                    \
-            if (mode_active) active_ms += t_ - mode_since_ms;         \
-            else parked_ms += t_ - mode_since_ms;                     \
-            duty_ema = duty_ema_advance(duty_ema, mode_active,       \
-                                        t_ - mode_since_ms);          \
-            mode_since_ms = t_; mode_active = (active);               \
-        }                                                             \
+
+    /* Steady-state precheck (PLAN 5c-1f defect): a cold scene windowed with
+     * the current knobs can only reach win_duty = active/(active+PROBE_IDLE_MS)
+     * streaming. If that ceiling sits under the engage floor, releasing
+     * bank_hold just re-latches a minute later — an endless HOLD/RESUME
+     * oscillation that parks/unparks and wakes the sensor every cycle while
+     * logging both edges. So: if windowing cannot hold this bank, the keeper
+     * latches ONCE and holds until reboot; retune PROBE_IDLE_MS (and/or
+     * WINDOW_FRAMES) so window duty clears MIN_DUTY_PCT before expecting
+     * savings from a flag=0 build. */
+    const int64_t win_active_ms = (int64_t)(PROBE_SETTLE + WINDOW_FRAMES) * PROBE_INTERVAL_MS;
+    const uint32_t win_duty = (uint32_t)((uint64_t)win_active_ms * DUTY_SCALE /
+                                         (win_active_ms + PROBE_IDLE_MS));
+    const bool window_clears_floor = win_duty >= DUTY_SCALED(MIN_DUTY_PCT);
+
+    /* Fold the just-closed streaming/parked segment into the gauge and the
+     * keeper EMA. Called exactly once BEFORE every parked mutation; the
+     * current parked value identifies which segment closed, so there is no
+     * second mode flag to keep in sync. */
+#define MODE_CLOSE() do {                                              \
+        int64_t t_ = now_ms();                                         \
+        if (!parked) active_ms += t_ - mode_since_ms;                  \
+        else parked_ms += t_ - mode_since_ms;                          \
+        duty_ema = duty_ema_advance(duty_ema, !parked, t_ - mode_since_ms); \
+        mode_since_ms = t_;                                            \
     } while (0)
 
     /* THE idle policy in one place: why are we forcing continuous streaming
@@ -604,18 +632,20 @@ void app_main(void)
                 ESP_LOGE(TAG, "sensor unpark failed, re-initializing camera");
                 camera_stop();
                 probe_restart_or_halt();
+                MODE_CLOSE(); /* was parked; re-init streams again */
                 parked = false;
                 window_left = 0;
-                MODE_TO(true);
                 continue;
             }
+            MODE_CLOSE(); /* closing the parked segment */
             parked = false;
             windows++;
             window_left = WINDOW_FRAMES;
-            MODE_TO(true);
         } else if (!HOLD_REASON(loop_start_ms) && window_left == 0) {
             /* Hot-hold expired with the sensor still streaming (e.g. after a
              * capture): resume windows without a park cycle first. */
+            windows++; /* every detection-window open counts: windows= is a
+                        * detection duty gauge, not a park-cycle counter */
             window_left = WINDOW_FRAMES;
         }
 
@@ -730,7 +760,7 @@ void app_main(void)
                  * long holds, which is when the hold reasons matter. */
                 const int64_t t = now_ms();
                 uint64_t da = active_ms, dp = parked_ms;
-                if (mode_active) da += t - mode_since_ms; else dp += t - mode_since_ms;
+                if (!parked) da += t - mode_since_ms; else dp += t - mode_since_ms;
                 uint64_t total_ms = da + dp;
                 const char *hold = HOLD_REASON(t);
                 ESP_LOGI(TAG, "probing: frames=%u captures=%u skips=%u windows=%u duty=%u%% hold=%s last hot=%d global=%d",
@@ -749,17 +779,22 @@ void app_main(void)
             /* Bank-keeper (slow feedback half; the night luma block above is
              * the fast feed-forward half): project the open duty segment and
              * latch the hold with hysteresis, so a cold idle never sits under
-             * the bank cutoff. duty_ema is scaled so 256 = 100%; thresholds
-             * are percent*2.56. */
-            uint32_t dema = duty_ema_advance(duty_ema, mode_active, iter_end_ms - mode_since_ms);
-            if (!bank_hold && dema < (uint32_t)(MIN_DUTY_PCT * 256 / 100)) {
+             * the bank cutoff. Scale/thresholds: DUTY_SCALED / DUTY_PCT. */
+            uint32_t dema = duty_ema_advance(duty_ema, !parked, iter_end_ms - mode_since_ms);
+            if (!bank_hold && dema < DUTY_SCALED(MIN_DUTY_PCT)) {
                 bank_hold = true;
-                ESP_LOGI(TAG, "bank keeper: duty %u%% under floor %d%%, holding continuous",
-                         (unsigned)(dema * 100 / 256), MIN_DUTY_PCT);
-            } else if (bank_hold && dema >= (uint32_t)((MIN_DUTY_PCT + DUTY_HYST_PCT) * 256 / 100)) {
+                if (window_clears_floor) {
+                    ESP_LOGI(TAG, "bank keeper: duty %u%% under floor %d%%, holding continuous",
+                             DUTY_PCT(dema), MIN_DUTY_PCT);
+                } else {
+                    ESP_LOGI(TAG, "bank keeper: windowed duty caps at %u%% under floor %d%%: holding continuous until reboot (set INCREASE_POWER_CONSUMPTION=1 or retune PROBE_IDLE_MS=%d -> window duty >= %d%%)",
+                             DUTY_PCT(win_duty), MIN_DUTY_PCT, PROBE_IDLE_MS, MIN_DUTY_PCT);
+                }
+            } else if (bank_hold && window_clears_floor &&
+                       dema >= DUTY_SCALED(MIN_DUTY_PCT + DUTY_HYST_PCT)) {
                 bank_hold = false;
                 ESP_LOGI(TAG, "bank keeper: duty %u%% recovered, windowing resumes",
-                         (unsigned)(dema * 100 / 256));
+                         DUTY_PCT(dema));
             }
         }
         if (HOLD_REASON(iter_end_ms)) {
@@ -769,12 +804,22 @@ void app_main(void)
             if (window_left == 0 && can_window) {
                 esp_err_t pk = sensor_set_parked(true);
                 if (pk == ESP_OK) {
+                    park_fails = 0;
+                    MODE_CLOSE(); /* closing the streaming segment */
                     parked = true;
                     park_until_ms = iter_end_ms + PROBE_IDLE_MS;
-                    MODE_TO(false);
                 } else if (pk == ESP_ERR_NOT_SUPPORTED) {
                     can_window = false;
                     ESP_LOGW(TAG, "sensor has no standby bit: staying on continuous probe");
+                } else if (++park_fails >= 3) {
+                    /* Degraded SCCB (connector corrosion, ribbon fatigue) is a
+                     * fault, not a feature: after 3 straight failures stop
+                     * paying a failed bus transaction per window and stop the
+                     * warn/re-init storm — continuous streaming is the
+                     * field-proven known-good state. One log, then quiet. */
+                    can_window = false;
+                    ESP_LOGE(TAG, "sensor park failed %d times (%s): falling back to continuous probe",
+                             park_fails, esp_err_to_name(pk));
                 } else {
                     ESP_LOGW(TAG, "sensor park failed: %s", esp_err_to_name(pk));
                 }
