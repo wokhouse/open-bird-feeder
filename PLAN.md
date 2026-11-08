@@ -8,7 +8,9 @@ On-device bird/no-bird model gates capture.
 
 ## Architecture
 
-Device: OV2640/OV3660 grayscale QQVGA probe frames at ~6.6 fps -> zone motion
+Device: OV2640/OV3660 grayscale QQVGA probe frames at ~6.6 fps while the zone is
+hot; a cold zone parks the sensor between ~1.5 s detection windows (5c step 1b)
+-> zone motion
 detector (firmware/main/zone_motion.c) -> on zone change (debounced, refractory
 4 s): capture XGA JPEG -> HTTP POST photo + the probe frame that triggered it +
 cell scores. Heartbeat photo every 15 min as fallback / liveness.
@@ -110,6 +112,33 @@ JEV_BIRD_P, default threshold P(bird) >= 0.5).
       streak, cap 128 s); stale reference frame reset (skips= counter in
       logs). Review-clean build on bingbong (bin 0.96 MB, 68% app partition
       free). FLASH + bank-gauge measurement pending — flashing in the am.
+   1b. Sensor-park windowed idle: IMPLEMENTED 2026-11-07 (branch
+      power-consumption-review; build 1.01 MB, 68% partition free, host
+      detector tests pass; flash + field A/B pending). Whole-app power audit
+      verdict: the sensor + DVP stream free-running all day is the dominant
+      daytime draw (Seeed forum: ~90 mA board floor after camera init vs 2-3
+      mA uninitialized; board ready-to-operate floor 5V@38.3 mA; LDO means
+      3.3V-side savings x1.51 at the bank). A fleet of read-only subagent
+      audits (camera driver / CPU-PM / wifi / detector / board+measurement)
+      ranked the levers; detector CPU (<2 mW), grab rate, fb layout, probe
+      size are all rounding errors — do not chase those. This step parks the
+      sensor between windows with its standby register, no esp_camera_deinit
+      (SCCB + DVP receiver stay up, registers retained): OV3660 SYSTEM_CTROL0
+      0x3008 bit6 (measured on this device: 1.5 mA parked vs 22-38 mA
+      streaming), OV2640 COM2 0x3009 bit4 (datasheet register-retentive
+      standby) — sensor_set_parked() in main.c picks by s->id.PID. Window =
+      unpark -> discard 2 wake frames -> 2 probe frames -> park;
+      PROBE_IDLE_MS=1500 between windows (est. ~25-40% sensor duty, NOT
+      measured). Any hot cell extends a 2.5 s continuous hot-hold, so
+      wildlife always runs the untouched 5a trigger pipeline; only the
+      empty-feeder phase duty-cycles. Unpark failure self-heals via full
+      camera re-init; sensors without a known standby bit stay on the old
+      continuous loop. No field ammeter: the "probing:" log line now reports
+      windows + active-vs-parked duty %, and /api/stats capture counts A/B
+      the quality. Tuning knobs: PROBE_IDLE_MS / WINDOW_FRAMES /
+      PROBE_HOT_HOLD_MS in main.c. Also fixed: mDNS is in sdkconfig.defaults
+      now — it had lived only in a generated sdkconfig, so any clean build
+      would silently break sleepy.local uploads.
    2. PIR wake + deep sleep (the trail-cam architecture): deep-sleep until the
       PIR fires, then run the existing probe+capture loop, idle-timeout back to
       sleep. Weeks per bank. Two hardware catches: the PIR must see the tray

@@ -12,6 +12,14 @@
 // uploads photo + probe frame, then powers the radio down again. On dial
 // failure the whole cycle is skipped and the motion gate backs off
 // exponentially (refractory << consecutive skips, capped ~2 min).
+// Daytime power: windowed idle. When the zone stays cold the sensor is
+// parked between detection windows with its datasheet standby bit (OV3660
+// 0x3008 bit6, measured 1.5 mA parked vs 22-38 mA streaming; OV2640 0x3009
+// bit4, register-retentive per datasheet) instead of streaming all day.
+// Any hot cell returns to continuous probing for PROBE_HOT_HOLD_MS, so
+// wildlife is always handled by the 5a continuous loop unchanged; only the
+// empty-feeder idle is duty-cycled. The periodic "probing:" log line
+// reports active-vs-parked duty — it is the field power gauge.
 //
 // Credentials/URL live in secrets.h. Console is USB-CDC only.
 
@@ -63,6 +71,17 @@ static const char *TAG = "birdcam";
 #define PROBE_INTERVAL_MS 150             /* ~6.6 fps */
 #define PROBE_SETTLE      2               /* frames discarded after each switch */
 #define PROBE_JPEG_QUALITY 40             /* upload of the frame that triggered */
+
+/* Windowed idle (daytime power): a cold zone parks the sensor between
+ * detection windows instead of streaming continuously. One window =
+ * unpark -> discard WAKE_SETTLE wake frames -> probe WINDOW_FRAMES frames.
+ * Any hot cell (bird/paw/branch edge in the zone) extends a continuous
+ * hot-hold, after which windows resume. These are the field tuning knobs;
+ * the duty percent in the periodic log shows what they cost. */
+#define PROBE_IDLE_MS     1500  /* sensor parked this long between windows */
+#define WINDOW_FRAMES     2     /* detection frames grabbed per window */
+#define WAKE_SETTLE       2     /* frames discarded after unpark (partial/AEC) */
+#define PROBE_HOT_HOLD_MS 2500  /* stay continuous this long after a hot cell */
 
 /* Photo mode: one XGA frame per capture. */
 #define PHOTO_FRAMESIZE   FRAMESIZE_XGA /* 1024x768 */
@@ -142,6 +161,28 @@ static void camera_stop(void)
 {
     esp_camera_deinit();
     vTaskDelay(pdMS_TO_TICKS(100));
+}
+
+/* Park/unpark the sensor's own streaming via its datasheet standby bit,
+ * leaving esp_camera, SCCB and the DVP receiver up — register contents are
+ * retained on both supported sensors, so a window re-opens with just a
+ * set_reg plus discarded wake frames:
+ *   OV3660: SYSTEM_CTROL0 (0x3008) bit6 — verified on this device in the
+ *     night-gate work: ~1.5 mA parked vs 22-38 mA while streaming.
+ *   OV2640: COM2 (0x3009) bit4 — datasheet: standby keeps all register
+ *     content, DVP stops. set_reg() takes (bank<<8)|addr for OV2640, so
+ *     0x3009 is bank 0, reg 0x09; the driver does the bank switch.
+ * Returns ESP_OK, ESP_ERR_NOT_SUPPORTED (no known standby bit), or a driver
+ * error. */
+static esp_err_t sensor_set_parked(bool parked)
+{
+    sensor_t *s = esp_camera_sensor_get();
+    if (!s || !s->set_reg) return ESP_ERR_NOT_SUPPORTED;
+    int reg, mask, val;
+    if (s->id.PID == OV3660_PID)      { reg = 0x3008; mask = 0x40; val = parked ? 0x40 : 0x00; }
+    else if (s->id.PID == OV2640_PID) { reg = 0x3009; mask = 0x10; val = parked ? 0x10 : 0x00; }
+    else return ESP_ERR_NOT_SUPPORTED;
+    return s->set_reg(s, reg, mask, val) == 0 ? ESP_OK : ESP_FAIL;
 }
 
 static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
@@ -428,12 +469,67 @@ void app_main(void)
         vTaskDelay(pdMS_TO_TICKS(2000));
         camera_stop();
     }
-    ESP_LOGI(TAG, "probing at %.1f fps, heartbeat %d ms, wifi=dial-before-call", 1000.0f / PROBE_INTERVAL_MS, HEARTBEAT_MS);
+    ESP_LOGI(TAG, "probe loop: continuous while hot, windowed idle=%d ms x%d frames hot-hold=%d ms, heartbeat %d ms, wifi=dial-before-call",
+             PROBE_IDLE_MS, WINDOW_FRAMES, PROBE_HOT_HOLD_MS, HEARTBEAT_MS);
 
     int64_t last_capture_ms = esp_timer_get_time() / 1000;
     unsigned captures = 0, skips = 0, skip_streak = 0;
 
+    /* Windowed idle state (see PROBE_IDLE_MS). Duty accounting is the field
+     * power gauge: active = sensor streaming, parked = sensor standby. */
+    bool can_window = true, parked = false, mode_active = true;
+    int window_left = 0;
+    int64_t hot_until_ms = 0, park_until_ms = 0;
+    int64_t mode_since_ms = esp_timer_get_time() / 1000;
+    uint32_t windows = 0;
+    uint64_t active_ms = 0, parked_ms = 0;
+#define MODE_TO(active) do {                                          \
+        if (mode_active != (active)) {                                \
+            int64_t t_ = esp_timer_get_time() / 1000;                \
+            if (mode_active) active_ms += t_ - mode_since_ms;         \
+            else parked_ms += t_ - mode_since_ms;                     \
+            mode_since_ms = t_; mode_active = (active);               \
+        }                                                             \
+    } while (0)
+
     while (true) {
+        /* While parked, wait out PROBE_IDLE_MS; then open a window: unpark,
+         * discard wake frames, and probe normally for WINDOW_FRAMES frames. */
+        int64_t t_ms = esp_timer_get_time() / 1000;
+        if (parked) {
+            if (t_ms < park_until_ms) {
+                vTaskDelay(pdMS_TO_TICKS(100));
+                continue;
+            }
+            bool wake_ok = sensor_set_parked(false) == ESP_OK;
+            for (int i = 0; wake_ok && i < WAKE_SETTLE; i++) {
+                camera_fb_t *sfb = esp_camera_fb_get();
+                if (!sfb) { wake_ok = false; break; }
+                esp_camera_fb_return(sfb);
+            }
+            if (!wake_ok) {
+                ESP_LOGE(TAG, "sensor unpark failed, re-initializing camera");
+                camera_stop();
+                while (probe_start() != ESP_OK) {
+                    ESP_LOGE(TAG, "probe re-init failed, retrying in 2 s");
+                    vTaskDelay(pdMS_TO_TICKS(2000));
+                    camera_stop();
+                }
+                parked = false;
+                window_left = 0;
+                MODE_TO(true);
+                continue;
+            }
+            parked = false;
+            windows++;
+            window_left = WINDOW_FRAMES;
+            MODE_TO(true);
+        } else if (t_ms >= hot_until_ms && window_left == 0) {
+            /* Hot-hold expired with the sensor still streaming (e.g. after a
+             * capture): resume windows without a park cycle first. */
+            window_left = WINDOW_FRAMES;
+        }
+
         camera_fb_t *fb = esp_camera_fb_get();
         if (!fb) {
             ESP_LOGE(TAG, "probe grab failed");
@@ -468,6 +564,13 @@ void app_main(void)
         const int64_t now_ms = esp_timer_get_time() / 1000;
         const int64_t since_ms = now_ms - last_capture_ms;
 
+        if (r.hot_cells > 0) {
+            /* Anything moving inside the zone: probe continuously while it
+             * does. The 5a trigger pipeline (150 ms frames, 2 consecutive)
+             * runs untouched for the whole hot-hold. */
+            hot_until_ms = now_ms + PROBE_HOT_HOLD_MS;
+        }
+
         bool shoot = false;
         const char *why = NULL;
         /* Consecutive dial failures back the motion gate off exponentially:
@@ -496,6 +599,9 @@ void app_main(void)
                 last_capture_ms = esp_timer_get_time() / 1000;
                 captures++;
                 skip_streak = 0;
+                /* A capture means wildlife: keep the fresh streaming sensor
+                 * continuous for a hot-hold (capture_photo left it running). */
+                hot_until_ms = last_capture_ms + PROBE_HOT_HOLD_MS;
             } else {
                 /* No IP: advance the timestamp anyway so the retry respects
                    the backoff, and reset the reference frame: it went stale
@@ -511,10 +617,35 @@ void app_main(void)
             wifi_power_down();
         } else {
             if (s_zone.frames % LOG_EVERY_FRAMES == 0) {
-                ESP_LOGI(TAG, "probing: frames=%u captures=%u skips=%u last hot=%d global=%d",
-                         (unsigned)s_zone.frames, captures, skips, r.hot_cells, r.global_mean);
+                uint64_t total_ms = active_ms + parked_ms;
+                ESP_LOGI(TAG, "probing: frames=%u captures=%u skips=%u windows=%u duty=%u%% last hot=%d global=%d",
+                         (unsigned)s_zone.frames, captures, skips, (unsigned)windows,
+                         total_ms ? (unsigned)(100 * active_ms / total_ms) : 100,
+                         r.hot_cells, r.global_mean);
             }
             esp_camera_fb_return(fb);
+        }
+
+        /* Window pacing: continuous while a hot-hold is live; otherwise count
+         * the window frames down and park the sensor once the zone is cold. */
+        int64_t p_ms = esp_timer_get_time() / 1000;
+        if (p_ms < hot_until_ms) {
+            window_left = 0;
+        } else if (window_left > 0) {
+            window_left--;
+            if (window_left == 0 && can_window) {
+                esp_err_t pk = sensor_set_parked(true);
+                if (pk == ESP_OK) {
+                    parked = true;
+                    park_until_ms = p_ms + PROBE_IDLE_MS;
+                    MODE_TO(false);
+                } else if (pk == ESP_ERR_NOT_SUPPORTED) {
+                    can_window = false;
+                    ESP_LOGW(TAG, "sensor has no standby bit: staying on continuous probe");
+                } else {
+                    ESP_LOGW(TAG, "sensor park failed: %s", esp_err_to_name(pk));
+                }
+            }
         }
         vTaskDelay(pdMS_TO_TICKS(PROBE_INTERVAL_MS));
     }
