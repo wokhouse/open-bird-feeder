@@ -135,7 +135,13 @@ JEV_BIRD_P, default threshold P(bird) >= 0.5).
       camera re-init; sensors without a known standby bit stay on the old
       continuous loop. No field ammeter: the "probing:" log line now reports
       windows + active-vs-parked duty %, and /api/stats capture counts A/B
-      the quality. Tuning knobs: PROBE_IDLE_MS / WINDOW_FRAMES /
+      the quality. Desk-verified 2026-11-07 (14.5 min run): cold scene sat
+      at duty=15% / 148 windows in the first 5 min; 8 motion captures ran
+      the full dial -> upload -> hot-hold path, zero upload failures, zero
+      faults; duty% climbs only while the zone is actually busy. Caveat for
+      the pole: hot-hold extends on hot_cells>0, so constant single-cell
+      ambient motion (leaves) would keep the sensor streaming — if the pole
+      logs show high duty with no captures, raise the extension threshold. Tuning knobs: PROBE_IDLE_MS / WINDOW_FRAMES /
       PROBE_HOT_HOLD_MS in main.c. Also fixed: mDNS is in sdkconfig.defaults
       now — it had lived only in a generated sdkconfig, so any clean build
       would silently break sleepy.local uploads.
