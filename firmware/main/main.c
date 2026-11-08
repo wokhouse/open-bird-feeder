@@ -106,6 +106,17 @@ static const char *TAG = "birdcam";
 #define NIGHT_LUMA_EXIT    60   /* any frame at/above this resumes windowing */
 #define NIGHT_DARK_FRAMES  30   /* ~50 s of window frames before declaring night */
 
+/* Bank-keeper duty floor: a cold windowed DAY sinks average draw under the
+ * same bank low-load cutoff as the night idle (field report 2026-11-07:
+ * daytime trips the bank too). Streaming duty is tracked with an EMA
+ * (scaled 256 = 100%) on the bank's trip timescale; below the floor,
+ * parking is skipped (continuous probe) until duty recovers with
+ * hysteresis. Busy scenes clear the floor by themselves and still get
+ * full windowed savings. Field-tuning knob: MIN_DUTY_PCT. */
+#define MIN_DUTY_PCT   45      /* hold streaming duty at/above this while idle */
+#define DUTY_HYST_PCT  10      /* windowing resumes at MIN+HYST */
+#define DUTY_TAU_MS    120000  /* bank cutoff timers are minutes, not seconds */
+
 /* Cap on the hex-encoded hot-cell bitmap we put in the X-Motion-Grid header
  * (150 bytes = 1200 cells; today's grid is 480). Over-cap = no header. */
 #define GRID_HEX_MAX_BYTES 150
@@ -171,6 +182,17 @@ static void camera_stop(void)
 {
     esp_camera_deinit();
     vTaskDelay(pdMS_TO_TICKS(100));
+}
+
+/* Fold a closed streaming-duty segment into the bank-keeper EMA (scaled
+ * 256 = 100%, time constant DUTY_TAU_MS). Segments longer than the time
+ * constant saturate the estimate — exact math is pointless past that. */
+static uint32_t duty_ema_advance(uint32_t ema, bool active, int64_t elapsed_ms)
+{
+    if (elapsed_ms <= 0) return ema;
+    if (elapsed_ms >= DUTY_TAU_MS) return active ? 256 : 0;
+    if (active) return ema + (uint32_t)(((uint64_t)(256 - ema) * elapsed_ms) / DUTY_TAU_MS);
+    return ema - (uint32_t)(((uint64_t)ema * elapsed_ms) / DUTY_TAU_MS);
 }
 
 /* Absolute scene luma for the night bank-keeper: zone_result_t.global_mean is
@@ -498,16 +520,20 @@ void app_main(void)
     /* Windowed idle state (see PROBE_IDLE_MS). Duty accounting is the field
      * power gauge: active = sensor streaming, parked = sensor standby. */
     bool can_window = true, parked = false, mode_active = true, night = false;
+    bool bank_hold = false;
     int window_left = 0, dark_run = 0;
     int64_t hot_until_ms = 0, park_until_ms = 0;
     int64_t mode_since_ms = esp_timer_get_time() / 1000;
     uint32_t windows = 0;
+    uint32_t duty_ema = 0; /* scaled 256=100%; starts at 0 = keeper engaged at boot */
     uint64_t active_ms = 0, parked_ms = 0;
 #define MODE_TO(active) do {                                          \
         if (mode_active != (active)) {                                \
             int64_t t_ = esp_timer_get_time() / 1000;                \
             if (mode_active) active_ms += t_ - mode_since_ms;         \
             else parked_ms += t_ - mode_since_ms;                     \
+            duty_ema = duty_ema_advance(duty_ema, mode_active,       \
+                                        t_ - mode_since_ms);          \
             mode_since_ms = t_; mode_active = (active);               \
         }                                                             \
     } while (0)
@@ -544,7 +570,7 @@ void app_main(void)
             windows++;
             window_left = WINDOW_FRAMES;
             MODE_TO(true);
-        } else if (!night && t_ms >= hot_until_ms && window_left == 0) {
+        } else if (!night && !bank_hold && t_ms >= hot_until_ms && window_left == 0) {
             /* Hot-hold expired with the sensor still streaming (e.g. after a
              * capture): resume windows without a park cycle first. */
             window_left = WINDOW_FRAMES;
@@ -651,10 +677,10 @@ void app_main(void)
         } else {
             if (s_zone.frames % LOG_EVERY_FRAMES == 0) {
                 uint64_t total_ms = active_ms + parked_ms;
-                ESP_LOGI(TAG, "probing: frames=%u captures=%u skips=%u windows=%u duty=%u%% last hot=%d global=%d",
+                ESP_LOGI(TAG, "probing: frames=%u captures=%u skips=%u windows=%u duty=%u%% keeper=%d last hot=%d global=%d",
                          (unsigned)s_zone.frames, captures, skips, (unsigned)windows,
                          total_ms ? (unsigned)(100 * active_ms / total_ms) : 100,
-                         r.hot_cells, r.global_mean);
+                         bank_hold ? 1 : 0, r.hot_cells, r.global_mean);
             }
             esp_camera_fb_return(fb);
         }
@@ -662,7 +688,20 @@ void app_main(void)
         /* Window pacing: continuous while a hot-hold is live; otherwise count
          * the window frames down and park the sensor once the zone is cold. */
         int64_t p_ms = esp_timer_get_time() / 1000;
-        if (night || p_ms < hot_until_ms) {
+        /* Bank-keeper: project the open duty segment and latch the hold with
+         * hysteresis, so a cold idle never sits under the bank cutoff.
+         * duty_ema is scaled so 256 = 100%; thresholds are percent*2.56. */
+        uint32_t dema = duty_ema_advance(duty_ema, mode_active, p_ms - mode_since_ms);
+        if (!bank_hold && dema < (uint32_t)(MIN_DUTY_PCT * 256 / 100)) {
+            bank_hold = true;
+            ESP_LOGI(TAG, "bank keeper: duty %u%% under floor %d%%, holding continuous",
+                     (unsigned)(dema * 100 / 256), MIN_DUTY_PCT);
+        } else if (bank_hold && dema >= (uint32_t)((MIN_DUTY_PCT + DUTY_HYST_PCT) * 256 / 100)) {
+            bank_hold = false;
+            ESP_LOGI(TAG, "bank keeper: duty %u%% recovered, windowing resumes",
+                     (unsigned)(dema * 100 / 256));
+        }
+        if (night || bank_hold || p_ms < hot_until_ms) {
             window_left = 0;
         } else if (window_left > 0) {
             window_left--;

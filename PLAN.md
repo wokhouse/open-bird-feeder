@@ -162,7 +162,25 @@ JEV_BIRD_P, default threshold P(bird) >= 0.5).
        intentional load; day savings untouched. If a bank has a
        low-current keep-on mode, that's the zero-waste alternative; and
        if the bank was actually DRY (not tripped), more night load makes
-       things worse, not better — check which one it was.
+       things worse, not better — check which it was.
+       1d. Bank-keeper duty floor (DAY): IMPLEMENTED + desk-verified
+        2026-11-07/08. Field follow-up: the bank trips on cold windowed
+        DAYS too (empty feeder = 15% duty is under its low-load cutoff).
+        The probe loop now tracks streaming duty with an EMA (scaled
+        256=100%, tau=120 s ~ bank trip timers); below MIN_DUTY_PCT=45%
+        parking is skipped ("bank keeper: duty N% under floor, holding
+        continuous") until projected duty recovers past 55%
+        ("windowing resumes"). Busy scenes clear the floor by themselves —
+        only the cold idle pays. Verified cycle on desk: boot hold ->
+        release at 67%/t+84 s -> 85 windows of savings -> re-latch at
+        44%/t+287 s -> re-release; cumulative duty pinned at 50%
+        (≈88 mA at 5V, above any common bank cutoff); motion captures and
+        hot-holds unaffected. First flash had a units bug (pct<<8 vs
+        pct*2.56 — keeper latched forever); caught by the on-device test,
+        fixed before this commit. Cost reality: a day at 50% duty is
+        close to the pre-5c draw — keeping a low-load-tripping bank awake
+        costs that; the zero-waste alternative stays a bank with a
+        low-current keep-on mode (or no auto-off at all).
    2. PIR wake + deep sleep (the trail-cam architecture): deep-sleep until the
       PIR fires, then run the existing probe+capture loop, idle-timeout back to
       sleep. Weeks per bank. Two hardware catches: the PIR must see the tray
