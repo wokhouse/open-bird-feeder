@@ -145,6 +145,24 @@ JEV_BIRD_P, default threshold P(bird) >= 0.5).
       PROBE_HOT_HOLD_MS in main.c. Also fixed: mDNS is in sdkconfig.defaults
       now — it had lived only in a generated sdkconfig, so any clean build
       would silently break sleepy.local uploads.
+   1c. Night bank-keeper: IMPLEMENTED 2026-11-07, field test tonight.
+       First field result of 1b: daytime captures great, but the battery
+       bank cuts output at night — the windowed night idle sits under the
+       bank low-load cutoff (~50 mA avg at 5V), exactly the PLAN's
+       documented bank trap (this build has no 5d night gate; that lives
+       unmerged on brightness-gate, so the pole ran windowed probing all
+       night). Fix in the probe loop: absolute frame luma via
+       frame_mean_luma() (zone_result_t.global_mean is a DIFFERENCE, not
+       light level — first attempt using it was wrong), sustained <40
+       (threshold verified in 5d's night-gate tests; AEC lifts real night
+       scenes to the 20s-30s) for 30 detection frames (~50 s) = night ->
+       windowing disabled, continuous probing restores the ~0.3-0.4 W
+       full-stream load that kept banks alive pre-5c. Any frame >= 60
+       (hysteresis) = dawn -> windowing resumes. Night cost ~4-5 Wh —
+       intentional load; day savings untouched. If a bank has a
+       low-current keep-on mode, that's the zero-waste alternative; and
+       if the bank was actually DRY (not tripped), more night load makes
+       things worse, not better — check which one it was.
    2. PIR wake + deep sleep (the trail-cam architecture): deep-sleep until the
       PIR fires, then run the existing probe+capture loop, idle-timeout back to
       sleep. Weeks per bank. Two hardware catches: the PIR must see the tray

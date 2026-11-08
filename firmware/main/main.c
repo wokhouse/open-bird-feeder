@@ -96,6 +96,16 @@ static const char *TAG = "birdcam";
 #define SKIP_BACKOFF_MAX 5         /* motion gate: refractory << skips, cap 128 s */
 #define LOG_EVERY_FRAMES 400 /* one info line per ~60 s of probing */
 
+/* Night bank-keeper: mobile power banks cut their output below a low-load
+ * threshold (~50 mA avg at 5 V); windowed night idle sits under that and
+ * the bank trips off mid-night. When the scene stays dark, stop parking
+ * and hold the full-stream load (~0.3-0.4 W at the bank) that kept banks
+ * alive in pre-5c firmware. Luma thresholds verified in the 5d night-gate
+ * tests (camera AEC lifts real night scenes to the 20s-30s, not 0). */
+#define NIGHT_LUMA_ENTER   40   /* sustained zone mean below this = dark */
+#define NIGHT_LUMA_EXIT    60   /* any frame at/above this resumes windowing */
+#define NIGHT_DARK_FRAMES  30   /* ~50 s of window frames before declaring night */
+
 /* Cap on the hex-encoded hot-cell bitmap we put in the X-Motion-Grid header
  * (150 bytes = 1200 cells; today's grid is 480). Over-cap = no header. */
 #define GRID_HEX_MAX_BYTES 150
@@ -161,6 +171,16 @@ static void camera_stop(void)
 {
     esp_camera_deinit();
     vTaskDelay(pdMS_TO_TICKS(100));
+}
+
+/* Absolute scene luma for the night bank-keeper: zone_result_t.global_mean is
+ * the mean DIFFERENCE (0 = static scene, day or night), not light level.
+ * Stride 7 over the grayscale frame = 2700 samples per QQVGA: negligible. */
+static int frame_mean_luma(const uint8_t *px, size_t len)
+{
+    unsigned sum = 0; size_t n = 0;
+    for (size_t i = 0; i < len; i += 7) { sum += px[i]; n++; }
+    return n ? (int)(sum / n) : 0;
 }
 
 /* Park/unpark the sensor's own streaming via its datasheet standby bit,
@@ -477,8 +497,8 @@ void app_main(void)
 
     /* Windowed idle state (see PROBE_IDLE_MS). Duty accounting is the field
      * power gauge: active = sensor streaming, parked = sensor standby. */
-    bool can_window = true, parked = false, mode_active = true;
-    int window_left = 0;
+    bool can_window = true, parked = false, mode_active = true, night = false;
+    int window_left = 0, dark_run = 0;
     int64_t hot_until_ms = 0, park_until_ms = 0;
     int64_t mode_since_ms = esp_timer_get_time() / 1000;
     uint32_t windows = 0;
@@ -524,7 +544,7 @@ void app_main(void)
             windows++;
             window_left = WINDOW_FRAMES;
             MODE_TO(true);
-        } else if (t_ms >= hot_until_ms && window_left == 0) {
+        } else if (!night && t_ms >= hot_until_ms && window_left == 0) {
             /* Hot-hold expired with the sensor still streaming (e.g. after a
              * capture): resume windows without a park cycle first. */
             window_left = WINDOW_FRAMES;
@@ -569,6 +589,19 @@ void app_main(void)
              * does. The 5a trigger pipeline (150 ms frames, 2 consecutive)
              * runs untouched for the whole hot-hold. */
             hot_until_ms = now_ms + PROBE_HOT_HOLD_MS;
+        }
+
+        const int luma = frame_mean_luma(fb->buf, fb->len);
+        if (!night) {
+            dark_run = luma < NIGHT_LUMA_ENTER ? dark_run + 1 : 0;
+            if (dark_run >= NIGHT_DARK_FRAMES) {
+                night = true;
+                ESP_LOGI(TAG, "night: bank-keeper on (continuous probe, luma=%d)", luma);
+            }
+        } else if (luma >= NIGHT_LUMA_EXIT) {
+            night = false;
+            dark_run = 0;
+            ESP_LOGI(TAG, "night: dawn detected, windowing resumes (luma=%d)", luma);
         }
 
         bool shoot = false;
@@ -629,7 +662,7 @@ void app_main(void)
         /* Window pacing: continuous while a hot-hold is live; otherwise count
          * the window frames down and park the sensor once the zone is cold. */
         int64_t p_ms = esp_timer_get_time() / 1000;
-        if (p_ms < hot_until_ms) {
+        if (night || p_ms < hot_until_ms) {
             window_left = 0;
         } else if (window_left > 0) {
             window_left--;
