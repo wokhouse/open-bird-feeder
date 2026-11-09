@@ -258,6 +258,32 @@ JEV_BIRD_P, default threshold P(bird) >= 0.5).
        near the floor with IDLE=400 — pick PROBE_IDLE_MS so the FIELD
        'probing:' duty sits clearly above MIN_DUTY_PCT, else keep
        flag=1. Board returned to the shipped flag=1 build and re-flashed.
+   1h. Darkness gate on CAPTURES: IMPLEMENTED 2026-11-08 (field defect).
+       Field report: the pole uploaded 33 photos whose stored JPEGs measure
+       mean luma 10-40 (server-side measurement over the last 4 days of
+       data/photo; 21 of them after 17:21 local on 11-08 while the scene
+       went dark). Nothing in the shipped build ever gated captures on
+       light: 5c-1c's night luma state machine only disables sensor
+       PARKING, and 5c-1f gated that block on can_window — so in the
+       flag=1 build it did not run at all. After dark the only zone
+       "motion" left is traffic, and its photos are black.
+       Fix: the luma state machine runs unconditionally (one 2700-sample
+       strided pass per probe frame — negligible), and the shoot decision
+       is gated on !night for BOTH the motion and the heartbeat path.
+       Thresholds unchanged: enter <40 sustained (NIGHT_DARK_FRAMES=30 =
+       ~4.5 s while streaming), exit >=60; measured night 9-30, day ~135,
+       headlight frames sit near the night floor, so a passing car cannot
+       open the gate. Night/dawn logs now name what they actually do
+       ("captures off", windowing clause only when the build can window),
+       and HOLD_REASON reports "no-park" first so the flag=1 gauge stops
+       claiming "night" is acting.
+       Deliberate scope: this is NOT the 5d deep-sleep night gate (still
+       unmerged on brightness-gate). This bank wants continuous load, so
+       the probe loop keeps streaming all night; only the photos stop —
+       and with them the night probe frames, which ride the same shoot
+       path. Field check with no console: uploads stop ~5 s after the
+       scene goes dark and resume on the first trigger once luma >= 60.
+       Not flashed here (no board on this box); built on bingbong.
    2. PIR wake + deep sleep (the trail-cam architecture): deep-sleep until the
       PIR fires, then run the existing probe+capture loop, idle-timeout back to
       sleep. Weeks per bank. Two hardware catches: the PIR must see the tray

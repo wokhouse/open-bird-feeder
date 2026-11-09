@@ -98,6 +98,10 @@ static const char *TAG = "birdcam";
 /* Night hold — the FAST feed-forward half of the bank-keeper (the duty
  * floor below is the slow feedback half; it would eventually latch a dark
  * night too, but ~1 DUTY_TAU late, so this path exists to act at dusk).
+ * The same luma signal closes the CAPTURE gate: after dark the scene has
+ * no wildlife in it, and the only zone "motion" left is traffic — those
+ * photos are black and worthless (field: 33 uploads at luma 10-40,
+ * 2026-11-08).
  * Mobile power banks cut their output below a low-load threshold
  * (~50 mA avg at 5 V); windowed night idle sits under that and the bank
  * trips off mid-night. When the scene stays dark, stop parking and hold
@@ -105,9 +109,11 @@ static const char *TAG = "birdcam";
  * pre-5c firmware. Luma thresholds verified in the 5d night-gate tests:
  * camera AEC lands real night scenes at values of 20-30, never 0. */
 #define NIGHT_LUMA_ENTER   40   /* sustained whole-frame mean luma below this
-                                 * = dark (frame_mean_luma, NOT the zone |diff|
-                                 * mean — see its comment) */
-#define NIGHT_LUMA_EXIT    60   /* any frame at/above this resumes windowing */
+                                 * = dark: captures stop, and (when windowing
+                                 * is allowed) parking stops too. Uses
+                                 * frame_mean_luma, NOT the zone |diff| mean —
+                                 * see its comment */
+#define NIGHT_LUMA_EXIT    60   /* any frame at/above this ends the night */
 #define NIGHT_DARK_FRAMES  30   /* detection frames before declaring night:
                                  * ≈35 s while windowed but only ≈4.5 s while
                                  * streaming — mode-dependent; make wall-clock
@@ -613,9 +619,9 @@ void app_main(void)
      * deliberately different clock snapshots on purpose: frame-time answers
      * "was the zone hot during this frame"; iter-end answers "is a hold
      * still live after an upload that consumed seconds". */
-#define HOLD_REASON(now) (night ? "night" : bank_hold ? "duty-floor" :  \
-                          (now) < hot_until_ms ? "hot" :                \
-                          !can_window ? "no-park" : NULL)
+#define HOLD_REASON(now) (!can_window ? "no-park" : night ? "night" : \
+                          bank_hold ? "duty-floor" :                    \
+                          (now) < hot_until_ms ? "hot" : NULL)
 
     while (true) {
         /* While parked, wait out PROBE_IDLE_MS; then open a window: unpark,
@@ -690,23 +696,30 @@ void app_main(void)
             hot_until_ms = frame_ms + PROBE_HOT_HOLD_MS;
         }
 
-        if (can_window) {
-            /* Night state is only interesting when parking is possible: a
-             * hold that changes nothing must not run, and its logs ("night:
-             * bank-keeper on", "dawn detected, windowing resumes") would
-             * claim actions this build cannot take. */
-            const int luma = frame_mean_luma(fb->buf, fb->len);
-            if (!night) {
-                dark_run = luma < NIGHT_LUMA_ENTER ? dark_run + 1 : 0;
-                if (dark_run >= NIGHT_DARK_FRAMES) {
-                    night = true;
-                    ESP_LOGI(TAG, "night: bank-keeper on (continuous probe, luma=%d)", luma);
-                }
-            } else if (luma >= NIGHT_LUMA_EXIT) {
-                night = false;
-                dark_run = 0;
-                ESP_LOGI(TAG, "night: dawn detected, windowing resumes (luma=%d)", luma);
+        /* Night state machine runs UNCONDITIONALLY. It gates two things:
+         * sensor parking (meaningful only when can_window) and the capture
+         * decision (always). Gating it on can_window — as the pre-merge
+         * cleanup did — made it dead code in the shipped flag=1 build, and
+         * the pole then uploaded black frames all night (field report
+         * 2026-11-08: 33 photos with mean luma 10-40; the only "motion"
+         * after dark is traffic). Thresholds are the 5d night-gate
+         * measurements: real night scenes land 9-30, day ~135, headlight
+         * frames sit near the night floor, so a passing car never opens
+         * the gate. */
+        const int luma = frame_mean_luma(fb->buf, fb->len);
+        if (!night) {
+            dark_run = luma < NIGHT_LUMA_ENTER ? dark_run + 1 : 0;
+            if (dark_run >= NIGHT_DARK_FRAMES) {
+                night = true;
+                ESP_LOGI(TAG, "night: luma=%d under %d for %d frames: captures off%s",
+                         luma, NIGHT_LUMA_ENTER, NIGHT_DARK_FRAMES,
+                         can_window ? ", windowing off (bank-keeper)" : "");
             }
+        } else if (luma >= NIGHT_LUMA_EXIT) {
+            night = false;
+            dark_run = 0;
+            ESP_LOGI(TAG, "night: dawn luma=%d: captures resume%s", luma,
+                     can_window ? ", windowing resumes" : "");
         }
 
         bool shoot = false;
@@ -717,10 +730,15 @@ void app_main(void)
          * HEARTBEAT_MS, not by this. */
         const int backoff_exp = (int)skip_streak > SKIP_BACKOFF_MAX ? SKIP_BACKOFF_MAX : (int)skip_streak;
         const int64_t motion_gap_ms = (int64_t)REFRACTORY_MS << backoff_exp;
-        if (r.trigger && since_ms >= motion_gap_ms) {
+        /* Darkness gate: while the scene reads dark, neither motion nor the
+         * heartbeat takes a photo. Detection and the luma watch keep
+         * streaming (the bank-keeper wants that load anyway), so dawn
+         * reopens this gate by itself — last_capture_ms only fell behind,
+         * which makes the first dawn trigger fire at once. */
+        if (!night && r.trigger && since_ms >= motion_gap_ms) {
             shoot = true;
             why = "motion";
-        } else if (HEARTBEAT_MS > 0 && since_ms >= HEARTBEAT_MS) {
+        } else if (!night && HEARTBEAT_MS > 0 && since_ms >= HEARTBEAT_MS) {
             shoot = true;
             why = "heartbeat";
         }
