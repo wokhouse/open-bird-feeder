@@ -1,11 +1,13 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
-import { RefreshCw, Sparkles } from 'lucide-react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { RefreshCw, Sparkles, Video } from 'lucide-react'
 import { FrameGrid } from '@/components/FrameGrid'
+import LivePanel from '@/components/LivePanel'
 import SelectionBar from '@/components/SelectionBar'
 import { Button } from '@/components/ui/button'
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import {
   classifyPending,
+  deviceOf,
   getImages,
   getStats,
   type Img,
@@ -67,6 +69,7 @@ export default function App() {
   const [sort, setSort] = useState<Sort>(sortFromLocation)
   const [error, setError] = useState<string | null>(null)
   const [classifying, setClassifying] = useState(false)
+  const [watching, setWatching] = useState<string | null>(null)
   const [selected, setSelected] = useState<Set<string>>(new Set())
   // index bookkeeping for shift+click range select, kept in sync with `shown`
   const shownIndex = useRef<Map<string, number>>(new Map())
@@ -171,6 +174,19 @@ export default function App() {
     tabFade.l ? 'transparent 0, #000 16px' : '#000 0'
   }, ${tabFade.r ? '#000 calc(100% - 16px), transparent 100%' : '#000 100%'})`
 
+  // live view follows the single device if there is one, else the newest frame's
+  const liveDevice = useMemo(() => {
+    const devices = new Set<string>()
+    for (const img of images) {
+      const d = deviceOf(img)
+      if (d) devices.add(d)
+    }
+    if (devices.size === 1) return [...devices][0]
+    let newest: Img | null = null
+    for (const img of images) if (!newest || img.path > newest.path) newest = img
+    return newest ? deviceOf(newest) : null
+  }, [images])
+
   // paths embed date+time, so their lexical order is chronological
   const byNewest = (a: Img, b: Img) => (a.path < b.path ? 1 : a.path > b.path ? -1 : 0)
   const shown = (filter === 'all' ? images : images.filter((m) => m.state === filter))
@@ -252,6 +268,16 @@ export default function App() {
               </option>
             ))}
           </select>
+          <Button
+            variant="outline"
+            disabled={!liveDevice}
+            aria-label="Watch live"
+            title={liveDevice ? `Watch ${liveDevice} live` : 'No frames yet'}
+            onClick={() => liveDevice && setWatching(liveDevice)}
+          >
+            <Video className="size-4" />
+            <span className="hidden sm:inline">Watch Live</span>
+          </Button>
           <Button onClick={runAIBatch} disabled={classifying}>
             <Sparkles className="size-4" />
             {classifying ? 'classifying…' : 'Bulk Classify'}
@@ -263,6 +289,14 @@ export default function App() {
         <div className="mb-4 rounded-md border border-red-300 bg-red-50 p-3 text-sm text-red-800">
           {error}
         </div>
+      )}
+
+      {watching && (
+        <LivePanel
+          device={watching}
+          onClose={() => setWatching(null)}
+          onError={setError}
+        />
       )}
 
       {shown.length === 0 ? (

@@ -14,6 +14,7 @@ export interface Img {
   note: string | null
   box: [number, number, number, number] | null // AI bbox, normalized 0..1 [x1,y1,x2,y2]
   taken_at: string | null // server-local wall clock, e.g. 2026-11-01T19:27:45
+  device?: string | null // newest servers send it; deviceOf() parses the path otherwise
 }
 
 export interface Stats {
@@ -70,3 +71,24 @@ export const bulk = (
 ): Promise<BulkResult> => post('/api/bulk', { paths, ...opts })
 export const classifyBulk = (paths: string[]): Promise<BatchResult> =>
   post('/api/classify_bulk', { paths })
+
+// photo/<date>/<HHMMSS>_<device>[_2].jpg — the storage path has always carried
+// the device; same parse as the ingest side (CAP_PARSE)
+export function deviceOf(img: Img): string | null {
+  if (img.device) return img.device
+  const m = /\d{6}_([\w.-]+?)(?:_\d+)?\.jpg$/.exec(img.path)
+  return m ? m[1] : null
+}
+
+export interface LiveArm {
+  ok: boolean
+  device: string
+  seconds: number
+}
+// while the window is open the device is told to stream (X-Live on its uploads)
+export const armLive = (device: string, minutes = 2): Promise<LiveArm> =>
+  post('/api/live_arm', { device, minutes })
+
+// `bust` re-requests the stream: the relay itself ends after ~20 s of quiet
+export const liveUrl = (device: string, bust?: number) =>
+  `/live.mjpg?device=${encodeURIComponent(device)}${bust ? `&t=${bust}` : ''}`
