@@ -351,24 +351,54 @@ JEV_BIRD_P, default threshold P(bird) >= 0.5).
      (zero extra camera reconfiguration), 5 fps pacing by 200 ms delays.
      Worst case 700 clips/day: ~2.3 GB/day upload, ~0.6 GB/day MP4 storage.
    Wire protocol (extends /upload, existing kinds untouched):
-   POST /upload?kind=video, headers X-Device-Id, X-Video-Session <id>,
-   X-Video-Seq <n>, body = concatenated JPEG frames (SOI/EOI framing; a
-   truncated tail frame is dropped). Chunk = VIDEO_CHUNK_FRAMES=5 frames
-   (~330 KB, ~1 s wall). Ingest keeps per-session state in memory, runs the
-   detector per frame, answers per chunk. On stop or idle-sweep (session
-   silent > 10 s — covers a mid-session upload failure): concatenate clean
-   frames -> ffmpeg mp4 -> data/video/<date>/HHMMSS_<device>.mp4 + capture
-   row kind='video' (schema needs no change; kind is free text). Fewer than
-   MIN_VIDEO_FRAMES=4 clean frames: drop the session. /api/images stays
-   photo-only until the review UI handles video (milestone 7b); files are
-   already served by the existing /files mount.
+   POST /upload?kind=video, headers X-Device-Id, X-Event-Id <id>,
+   X-Video-Seq <n>, X-Session-Kind motion|ordered, body = concatenated JPEG
+   frames (SOI/EOI framing; a truncated tail frame is dropped). The
+   X-Event-Id is generated once per capture cycle and ALSO sent on the
+   trigger photo's upload — it is the join key between footage and the
+   decision model. Chunk = VIDEO_CHUNK_FRAMES=5 frames (~330 KB, ~1 s wall).
+   Ingest keeps per-session state in memory, runs the detector per frame,
+   answers per chunk.
+   THE DECISION MODEL IS IN THE LOOP (decided 2026-11-09): a clip is
+   recorded only if the event's decision says bird. On session end the raw
+   frames go to data/pending/; if the trigger photo already has a verdict
+   (Jev) or human label, the clip is kept (encode + capture row
+   kind='video' with the event_id) or discarded (no_bird) immediately; if
+   undecided it stays pending, and any later verdict or review label
+   decides it (on_verdict hook in app.py). Video Pending longer than
+   VIDEO_PENDING_MAX_S (48 h) is kept as-is (undecided = give the human
+   the footage) — cheap: raws are ~3x MP4 size and rare.
+   LIVE WINDOWS (7c) decide when the camera may stream at all, and the
+   gateway owns that state: arm(device, seconds, source=model|browser).
+   model: a Jev bird verdict on the event photo arms
+   VIDEO_MODEL_WINDOW_S (default 60) — the alert says bird, and the app
+   can SHOW the bird: an in-flight session's quiet-stop/cap is overridden
+   while the window is open (the footage of the bird is exactly what we
+   want), and an idle device learns of the window from the X-Live header
+   on its next upload response or from an optional dial poll
+   (LIVE_POLL_MS dial + GET /api/live_status, body "<seconds>" or "0";
+   ~0.05% duty at 180000 ms). browser: Watch-Live in the review UI posts
+   /api/live_arm {device, minutes}; same mechanics; ordered sessions
+   (X-Session-Kind: ordered) exist only for the window and are teed to
+   the browser but NEVER recorded. Every streamed frame is teed to an
+   in-memory ring; GET /live.mjpg?device= relays it as multipart MJPEG —
+   the browser never talks to the device (tailnet-safe either way).
+   On stop or idle-sweep (session silent > 10 s — covers a mid-session
+   upload failure): decided as above; kept clips go through ffmpeg to
+   data/video/<date>/HHMMSS_<device>.mp4 + capture row kind='video'. Fewer
+   than MIN_VIDEO_FRAMES clean frames: drop. /api/images stays photo-only
+   until the review UI handles video (milestone 7b); files are already
+   served by the existing /files mount.
    Firmware flow per motion capture (heartbeat stays photo-only): existing
-   photo path unchanged through the still upload; then, still in JPEG XGA
-   mode, stream chunks until stop/error/cap; then camera_stop + probe_start
-   (existing tail). Refractory starts after the clip ends (last_capture_ms
-   set after everything). Chunk transport failure = end session now; the Pi
-   keeps whatever arrived. PSRAM chunk buffer ~750 KB, freed after the
-   session.
+   photo path unchanged through the still upload (now with X-Event-Id);
+   then, still in JPEG XGA mode, stream chunks until 204/error/hard cap
+   (VIDEO_MAX_FRAMES=300 = 60 s ceiling; the Pi's 204 is the real end,
+   and it keeps 204 back while a live window is open); then camera_stop +
+   probe_start (existing tail). A heartbeat response carrying X-Live >0,
+   or a live_status poll answer >0, runs one ordered session in the same
+   dial. Refractory starts after everything ends. Chunk transport failure =
+   end session now; the Pi keeps whatever arrived. PSRAM chunk buffer
+   ~750 KB, freed after the session.
    Energy: clips are event-gated like today's uploads — ~0.5 W extra for
    ≤20 s per event, <1 Wh/day at 700 events/day vs the ~20-30 Wh/day probe
    baseline. Video is power-cheap precisely because the gate already dials
@@ -382,28 +412,37 @@ JEV_BIRD_P, default threshold P(bird) >= 0.5).
    7b (next): review UI plays /files/video/... clips; video rows in
    /api/images additive; consider auto-discard of no-bird clips (the still
    verdict already exists per event) to cut storage.
-   STATUS 2026-11-09: 7a implemented on BOTH sides. Ingest (b9c64d4)
-   verified end-to-end on a throwaway instance (quiet-stop 204, frame-cap,
-   abandoned-session sweep; exact MP4 frame counts; photo queue untouched).
-   Firmware: capture_video_burst in main.c, builds clean on bingbong
-   (birdcam.bin 1.01 MB, 68% app free). Awaiting: live-service restart +
-   device flash + field test of one real motion event.
+   STATUS 2026-11-09 (2): 7a + decision gate + 7c live windows implemented
+   on BOTH sides. Ingest rework: event_id schema column + migration,
+   pending/decide lifecycle, live windows + arm/status/relay endpoints,
+   X-Live response headers, verdict/label hooks into the clip gate.
+   Verified end-to-end on a throwaway instance (25 checks: quiet-hold,
+   bird label -> MP4 with exact frame count, no-bird -> discard, window
+   suppresses quiet-stop then ordinary rules resume, ordered session not
+   recorded, /live.mjpg relay, photo queue untouched). Firmware:
+   video_stream_session(motion|ordered), X-Event-Id on photo+chunks,
+   X-Live response parsing, live_status dial poll (LIVE_POLL_MS=180000);
+   builds clean on bingbong. Awaiting: live-service restart + device
+   flash + field test of one real motion event (expect: pending ->
+   verdict -> kept or discarded clip). 7b (review UI plays clips) still
+   open; the video rows now carry event_id so the UI can join a clip to
+   its photo card.
    7c LIVE VIEW (decided 2026-11-09): a Watch-Live button, NOT an
    always-on stream. Power from phase 5: the 0.91 W probe floor is mostly
-   the dial-before-call saving (0.2-0.3 W); a live viewer needs an
-   associated radio anyway, so the honest cost is radio idle
-   (~50-70 mA modem-sleep) ONLY while a watch is armed. Design: the Pi
-   owns the watch state (POST /api/live_arm {device, minutes}; re-arm
-   from the UI while the player is open; expiry auto-disarms). The
-   device learns of an armed watch from a new header on its NEXT upload
-   response (X-Live: on/off) — zero extra requests, no device HTTP
-   server change, works with dial-before-call. While armed, the device
-   posts frames to /upload?kind=live (VGA q low, ~5 fps; NOT stored)
-   and the Pi relays them to the browser via GET /live.mjpg (chunked
-   multipart), so the browser never needs direct device reach
-   (tailnet-safe). Device streams until an upload says live is off or
-   the stream window ends, then back to probe. Live frames are not
-   recorded; recordings stay motion-gated (7a).
+   the dial-before-call saving (0.2-0.3 W). The implemented answer keeps
+   dial-before-call AND puts the activation decision on the gateway:
+   streaming happens only when a live window is open, and windows open on
+   (a) the decision model seeing a bird (model verdict -> 60 s window:
+   extend the current session, or run an ordered one via the next
+   response header / dial poll) or (b) a browser request (Watch-Live ->
+   /api/live_arm; the device learns at its next contact or at the
+   LIVE_POLL_MS dial poll — bounded latency, no always-on radio). A dial
+   poll every 180 s costs ~2 s of connect each: ~0.05% duty, negligible
+   at the base. The model-verdict path costs ZERO extra device wakeups
+   (verdict lands while the device is still online for its own session).
+   Frames stream over the existing /upload?kind=video framing and are
+   relayed to the browser via /live.mjpg; ordered frames are never
+   recorded. No device HTTP server, no inbound path to the ESP32.
 
 Decision at end of Phase 3 (alt): stream probes to Pi for a real detector instead
 of on-device model — pipeline is the same either way.

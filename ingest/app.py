@@ -60,6 +60,7 @@ import json
 import os
 import re
 import sqlite3
+import threading
 from pathlib import Path
 
 import jev
@@ -67,7 +68,7 @@ import notify
 import video
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import PlainTextResponse, Response
+from fastapi.responses import JSONResponse, PlainTextResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 DATA = Path(os.environ.get("INGEST_DATA", Path(__file__).parent / "data")).resolve()
@@ -91,7 +92,8 @@ def db() -> sqlite3.Connection:
         """
         CREATE TABLE IF NOT EXISTS capture(
           id INTEGER PRIMARY KEY, path TEXT UNIQUE NOT NULL, kind TEXT NOT NULL,
-          device_id TEXT, taken_at TEXT, bytes INTEGER, ingested_at TEXT NOT NULL);
+          device_id TEXT, taken_at TEXT, bytes INTEGER, ingested_at TEXT NOT NULL,
+          event_id TEXT);
         CREATE TABLE IF NOT EXISTS verdict(
           id INTEGER PRIMARY KEY, capture_id INTEGER NOT NULL REFERENCES capture(id),
           model TEXT NOT NULL, p_bird REAL, state_hint TEXT, box TEXT, note TEXT,
@@ -116,7 +118,8 @@ CAP_PARSE = re.compile(
 
 
 def ensure_capture(conn, rel: str, kind: str = "photo", device: str | None = None,
-                   taken_at: str | None = None, size: int | None = None) -> int:
+                   taken_at: str | None = None, size: int | None = None,
+                   event_id: str | None = None) -> int:
     """One capture row per stored file. Device and capture time are parsed from
     the storage path when not supplied at upload — the filename has been
     carrying these facts all along; now they are columns."""
@@ -131,8 +134,9 @@ def ensure_capture(conn, rel: str, kind: str = "photo", device: str | None = Non
         p = DATA / rel
         size = p.stat().st_size if p.is_file() else None
     conn.execute(
-        "INSERT OR IGNORE INTO capture(path,kind,device_id,taken_at,bytes,ingested_at) "
-        "VALUES(?,?,?,?,?,?)", (rel, kind, device, taken_at, size, now()))
+        "INSERT OR IGNORE INTO capture(path,kind,device_id,taken_at,bytes,"
+        "ingested_at,event_id) VALUES(?,?,?,?,?,?,?)",
+        (rel, kind, device, taken_at, size, now(), event_id))
     return conn.execute("SELECT id FROM capture WHERE path=?", (rel,)).fetchone()["id"]
 
 
@@ -173,6 +177,24 @@ def migrate_v2() -> None:
 
 
 migrate_v2()
+
+
+def migrate_video() -> None:
+    """Phase 7a/7c: capture.event_id — the join key that ties streamed
+    footage to its trigger photo, so the event's decision (Jev verdict or
+    human label) can gate whether the clip is kept. Idempotent ALTER; a
+    fresh DB already carries the column from the schema block above."""
+    with db() as conn:
+        if "event_id" not in [c[1] for c in conn.execute("PRAGMA table_info(capture)")]:
+            conn.execute("ALTER TABLE capture ADD COLUMN event_id TEXT")
+            print("[migrate] capture.event_id added", flush=True)
+        # the index lives here, not in the schema block: an old DB hits the
+        # bootstrap CREATE before the ALTER, and CREATE INDEX would crash on
+        # the missing column
+        conn.execute("CREATE INDEX IF NOT EXISTS capture_event ON capture(event_id)")
+
+
+migrate_video()
 
 
 def list_images() -> list[str]:
@@ -281,15 +303,21 @@ async def upload(request: Request, background_tasks: BackgroundTasks, kind: str 
     if not body or len(body) > 2_000_000:
         raise HTTPException(400, f"body must be 1B..2MB, got {len(body)}")
     for sess in video.expired_sessions():  # abandoned clips close on any traffic
-        background_tasks.add_task(video.assemble, sess)
+        background_tasks.add_task(video.finalize, sess)
+    device = SAFE(request.headers.get("x-device-id", "unknown"))
     if kind == "video":
         # streamed clip chunks: the Pi-side zone detector decides the clip's
-        # end; 204 tells the device to stop, 200 to keep streaming.
+        # end; 204 tells the device to stop, 200 to keep streaming. Whether
+        # the clip is kept at all is decided by the event's bird verdict
+        # (X-Event-Id joins chunks to the trigger photo — see video.py).
         status, finished = video.handle_video(body, request.headers)
         for sess in finished:
-            background_tasks.add_task(video.assemble, sess)
-        return Response(status_code=status)
-    device = SAFE(request.headers.get("x-device-id", "unknown"))
+            background_tasks.add_task(video.finalize, sess)
+        for sess in video.sweep_pending():
+            background_tasks.add_task(video.finalize, sess)
+        rem, _src = video.window_state(device)
+        return Response(status_code=status, headers={"X-Live": str(rem)})
+    event = re.sub(r"[^\w.-]", "", request.headers.get("x-event-id", ""))[:64] or None
     ts = datetime.datetime.now()
     folder = DATA / kind / ts.strftime("%Y-%m-%d")
     folder.mkdir(parents=True, exist_ok=True)
@@ -301,14 +329,17 @@ async def upload(request: Request, background_tasks: BackgroundTasks, kind: str 
     path.write_bytes(body)
     rel = str(path.relative_to(DATA))
     with db() as conn:  # the device/time/size facts the filename was faking
-        ensure_capture(conn, rel, kind, device, ts.isoformat(timespec="seconds"), len(body))
+        ensure_capture(conn, rel, kind, device, ts.isoformat(timespec="seconds"),
+                       len(body), event)
     if kind == "probe":
         save_motion_grid(path, request.headers)
     else:
         # photos get AI review as they land; probes stay manual (they're for the
         # future on-device model comparison, not the birder queue)
         background_tasks.add_task(auto_classify, rel)
-    return {"ok": True, "path": rel, "bytes": len(body)}
+    rem, _src = video.window_state(device)  # tells an online device: stream
+    return JSONResponse({"ok": True, "path": rel, "bytes": len(body)},
+                        headers={"X-Live": str(rem)})
 
 
 def auto_classify(rel: str) -> None:
@@ -366,10 +397,33 @@ def apply_verdict(rel: str, v: dict) -> str:
              json.dumps(v["box"]) if v.get("box") else None, v.get("note"),
              v.get("cost_usd"), v.get("latency_ms"), now()))
         h = conn.execute("SELECT state FROM human_label WHERE capture_id=?", (cid,)).fetchone()
+        dev_ev = conn.execute("SELECT device_id, event_id FROM capture WHERE id=?",
+                              (cid,)).fetchone()
     state = h["state"] if h else ("bird_identified" if v["bird"] else "no_bird")
     if state == "bird_identified" and not was_bird:
         notify.bird_detected(rel, v)
+        # the decision model drives the camera too: a confirmed bird opens a
+        # live window, so the alert says "bird" and the app can show it —
+        # extending an in-flight session or ordering a fresh stream.
+        if dev_ev and dev_ev["device_id"]:
+            video.arm(dev_ev["device_id"], video.VIDEO_MODEL_WINDOW_S, "model")
+    if dev_ev and dev_ev["event_id"]:
+        # a held clip for this event is decided by this verdict
+        for sess in video.on_verdict(dev_ev["event_id"]):
+            threading.Thread(target=video.finalize, args=(sess,),
+                             daemon=True).start()
     return state
+
+
+def decide_pending_for_path(rel: str) -> None:
+    """Human labels gate clips too: label a photo bird and its held clip is
+    encoded; no_bird and the raw frames go."""
+    with db() as conn:
+        r = conn.execute("SELECT event_id FROM capture WHERE path=?", (rel,)).fetchone()
+    if not r or not r["event_id"]:
+        return
+    for sess in video.on_verdict(r["event_id"]):
+        threading.Thread(target=video.finalize, args=(sess,), daemon=True).start()
 
 
 @app.post("/api/delete_photo")
@@ -416,7 +470,61 @@ async def set_state(request: Request):
             "INSERT INTO human_label(capture_id,state,species,ts) VALUES(?,?,?,?) "
             "ON CONFLICT(capture_id) DO UPDATE SET state=?,species=?,ts=?",
             (cid, state, species, now(), state, species, now()))
+    decide_pending_for_path(rel)
     return {"ok": True, "path": rel, "state": state, "species": species}
+
+
+@app.post("/api/live_arm")
+async def live_arm(request: Request):
+    """Watch-Live: open/extend this device's live window (default 2 min).
+    The window is what makes the device stream at all — while it is open,
+    the next upload response carries X-Live: 1 and an idle device that
+    polls /api/live_status starts streaming immediately. Browsers keep it
+    open with this call every ~minute while the player is visible."""
+    body = await request.json()
+    device = SAFE(str(body.get("device", "unknown")))
+    minutes = float(body.get("minutes", 2))
+    seconds = video.arm(device, minutes * 60.0, "browser")
+    return {"ok": True, "device": device, "seconds": int(seconds)}
+
+
+@app.get("/api/live_status")
+async def live_status(device: str):
+    """The idle device's poll (~every 5 s while the radio is up). Body:
+    '1 <seconds-left>' when streaming is requested, '0' otherwise. No
+    DB, no storage: this is the cheapest thing the Pi can answer."""
+    rem, _source = video.window_state(device)
+    return PlainTextResponse(f"1 {rem}" if rem else "0")
+
+
+@app.get("/live.mjpg")
+async def live_mjpg(device: str, quiet_stop_s: float = 20.0):
+    """The browser's live feed: multipart MJPEG relay of whatever the device
+    last streamed (tee ring in video.py). Streams one frame at a time,
+    newest-wins, and ends after quiet_stop_s with no new frames — the UI
+    reopens it while watching. This is why the browser never needs to
+    reach the ESP32."""
+    dev = SAFE(device)
+
+    async def gen():
+        seen, idle = 0.0, 0.0
+        while True:
+            snap = video.live_snapshot(dev)
+            fresh = [(t, f) for f, t in snap if t > seen]
+            if fresh:
+                t, frame = fresh[-1]
+                seen = t
+                head = (b"--frame\r\nContent-Type: image/jpeg\r\n"
+                        b"Content-Length: " + str(len(frame)).encode() + b"\r\n\r\n")
+                yield head + frame
+                idle = 0.0
+            else:
+                idle += 0.5
+                if idle >= quiet_stop_s:
+                    return
+            await asyncio.sleep(0.5)
+
+    return StreamingResponse(gen(), media_type="multipart/x-mixed-replace; boundary=frame")
 
 
 @app.post("/api/bulk")
@@ -443,6 +551,7 @@ async def bulk(request: Request):
             raise HTTPException(400, "species_identified requires a species name")
 
     done, failed = 0, []
+    labeled_events: list[str] = []  # bulk human labels can decide held clips too
     with db() as conn:
         for raw in paths:
             try:
@@ -469,9 +578,16 @@ async def bulk(request: Request):
                         "INSERT INTO human_label(capture_id,state,species,ts) VALUES(?,?,?,?) "
                         "ON CONFLICT(capture_id) DO UPDATE SET state=?,species=?,ts=?",
                         (cid, state, species, now(), state, species, now()))
+                    ev = conn.execute("SELECT event_id FROM capture WHERE id=?",
+                                      (cid,)).fetchone()
+                    if ev and ev["event_id"]:
+                        labeled_events.append(ev["event_id"])
                 done += 1
             except Exception as e:
                 failed.append({"path": str(raw), "error": str(e)})
+    for event_id in labeled_events:
+        for sess in video.on_verdict(event_id):
+            threading.Thread(target=video.finalize, args=(sess,), daemon=True).start()
     return {"ok": True, "done": done, "failed": failed}
 
 
