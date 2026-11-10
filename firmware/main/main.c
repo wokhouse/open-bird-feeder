@@ -12,6 +12,14 @@
 // uploads photo + probe frame, then powers the radio down again. On dial
 // failure the whole cycle is skipped and the motion gate backs off
 // exponentially (refractory << consecutive skips, capped ~2 min).
+// Daytime power: windowed idle. When the zone stays cold the sensor is
+// parked between detection windows with its datasheet standby bit (OV3660
+// 0x3008 bit6, measured 1.5 mA parked vs 22-38 mA streaming; OV2640 0x3009
+// bit4, register-retentive per datasheet) instead of streaming all day.
+// Any hot cell returns to continuous probing for PROBE_HOT_HOLD_MS, so
+// wildlife is always handled by the 5a continuous loop unchanged; only the
+// empty-feeder idle is duty-cycled. The periodic "probing:" log line
+// reports active-vs-parked duty — it is the field power gauge.
 //
 // Credentials/URL live in secrets.h. Console is USB-CDC only.
 
@@ -65,6 +73,16 @@ static const char *TAG = "birdcam";
 #define PROBE_SETTLE      2               /* frames discarded after each switch */
 #define PROBE_JPEG_QUALITY 40             /* upload of the frame that triggered */
 
+/* Windowed idle (daytime power): a cold zone parks the sensor between
+ * detection windows instead of streaming continuously. One window =
+ * unpark -> discard PROBE_SETTLE wake frames -> probe WINDOW_FRAMES frames.
+ * Any hot cell (bird/paw/branch edge in the zone) extends a continuous
+ * hot-hold, after which windows resume. These are the field tuning knobs;
+ * the duty percent in the periodic log shows what they cost. */
+#define PROBE_IDLE_MS     1500  /* sensor parked this long between windows */
+#define WINDOW_FRAMES     2     /* detection frames grabbed per window */
+#define PROBE_HOT_HOLD_MS 2500  /* stay continuous this long after a hot cell */
+
 /* Photo mode: one XGA frame per capture. */
 #define PHOTO_FRAMESIZE   FRAMESIZE_XGA /* 1024x768 */
 #define PHOTO_JPEG_QUALITY 12
@@ -99,6 +117,61 @@ static const char *TAG = "birdcam";
 #define SKIP_BACKOFF_MAX 5         /* motion gate: refractory << skips, cap 128 s */
 #define LOG_EVERY_FRAMES 400 /* one info line per ~60 s of probing */
 
+/* Night hold — the FAST feed-forward half of the bank-keeper (the duty
+ * floor below is the slow feedback half; it would eventually latch a dark
+ * night too, but ~1 DUTY_TAU late, so this path exists to act at dusk).
+ * The same luma signal closes the CAPTURE gate: after dark the scene has
+ * no wildlife in it, and the only zone "motion" left is traffic — those
+ * photos are black and worthless (field: 33 uploads at luma 10-40,
+ * 2026-11-08).
+ * Mobile power banks cut their output below a low-load threshold
+ * (~50 mA avg at 5 V); windowed night idle sits under that and the bank
+ * trips off mid-night. When the scene stays dark, stop parking and hold
+ * the full-stream load (~0.3-0.4 W at the bank) that kept banks alive in
+ * pre-5c firmware. Luma thresholds verified in the 5d night-gate tests:
+ * camera AEC lands real night scenes at values of 20-30, never 0. */
+#define NIGHT_LUMA_ENTER   40   /* sustained whole-frame mean luma below this
+                                 * = dark: captures stop, and (when windowing
+                                 * is allowed) parking stops too. Uses
+                                 * frame_mean_luma, NOT the zone |diff| mean —
+                                 * see its comment */
+#define NIGHT_LUMA_EXIT    60   /* any frame at/above this ends the night */
+#define NIGHT_DARK_FRAMES  30   /* detection frames before declaring night:
+                                 * ≈35 s while windowed but only ≈4.5 s while
+                                 * streaming — mode-dependent; make wall-clock
+                                 * when the idle policy is unified (PLAN 5c) */
+
+/* Field reality (2026-11-08): this pole's power bank still trips its
+ * low-load cutoff even with the duty floor below — it wants continuous
+ * load. Set to 1: the camera sensor is NEVER parked, all day. Every
+ * other power optimization (dial-before-call, capture pipeline, and the
+ * whole windowed-idle machinery for a friendlier bank) stays compiled
+ * and armed; only sensor parking is suppressed. Set to 0 if a bank
+ * without a low-load auto-off is fitted, and windowed idle returns. */
+#define INCREASE_POWER_CONSUMPTION 1
+
+/* Bank-keeper duty floor — the SLOW feedback half of the bank-keeper
+ * (the night luma hold above is the fast feed-forward half). A cold
+ * windowed DAY sinks average draw under the
+ * same bank low-load cutoff as the night idle (field report 2026-11-07:
+ * daytime trips the bank too). Streaming duty is tracked with an EMA
+ * (fixed-point, DUTY_SCALE = 100%) on the bank's trip timescale; below the floor,
+ * parking is skipped (continuous probe) until duty recovers with
+ * hysteresis. Busy scenes clear the floor by themselves and still get
+ * full windowed savings. Field-tuning knob: MIN_DUTY_PCT. */
+#define MIN_DUTY_PCT   45      /* hold streaming duty at/above this while idle */
+#define DUTY_HYST_PCT  10      /* windowing resumes at MIN+HYST */
+#define DUTY_TAU_MS    120000  /* bank cutoff timers are minutes, not seconds */
+
+/* Fixed-point duty arithmetic. Scale is 65536 = 100% (Q16): at Q8 the
+ * realistic 150-1500 ms segment folds truncate toward zero ASYMMETRICALLY
+ * and the controller drifts below its own math (field-caught once, PLAN
+ * 5c-1d); at Q16 even a single 150 ms frame fold carries exact units.
+ * Never hand-write these conversions at a call site. */
+#define DUTY_SCALE       65536u
+#define DUTY_SCALED(pct) ((uint32_t)(((uint64_t)(pct) * DUTY_SCALE) / 100))
+#define DUTY_PCT(ema)    ((unsigned)(((uint64_t)(ema) * 100) / DUTY_SCALE))
+
 /* Cap on the hex-encoded hot-cell bitmap we put in the X-Motion-Grid header
  * (150 bytes = 1200 cells; today's grid is 480). Over-cap = no header. */
 #define GRID_HEX_MAX_BYTES 150
@@ -120,6 +193,27 @@ static char s_event_id[64];
 static volatile int s_live_secs;  /* X-Live from the gateway's response */
 static zone_motion_t s_zone;
 static bool s_zone_ready;
+
+/* One monotonic millisecond clock. Every timestamp in the probe loop goes
+ * through it; the loop's snapshots are named for WHEN they were taken, on
+ * purpose: an upload consumes seconds, so tail pacing must see post-capture
+ * time and must not be "unified" with the frame-time snapshot. */
+static inline int64_t now_ms(void) { return esp_timer_get_time() / 1000; }
+
+/* Discard n frames after a sensor state change (format switch, unpark):
+ * the first frames can be partial or stale. Returns false if a grab came
+ * back NULL; callers decide what that means. The 100 ms spacing matches
+ * the probe frame period. */
+static bool discard_frames(int n)
+{
+    for (int i = 0; i < n; i++) {
+        camera_fb_t *fb = esp_camera_fb_get();
+        if (!fb) return false;
+        esp_camera_fb_return(fb);
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    return true;
+}
 
 static esp_err_t camera_start(pixformat_t format, framesize_t size, int quality, int settle)
 {
@@ -157,11 +251,7 @@ static esp_err_t camera_start(pixformat_t format, framesize_t size, int quality,
         return err;
     }
     /* The first frames after a format switch can be partial or stale. */
-    for (int i = 0; i < settle; i++) {
-        camera_fb_t *fb = esp_camera_fb_get();
-        if (fb) esp_camera_fb_return(fb);
-        vTaskDelay(pdMS_TO_TICKS(100));
-    }
+    (void)discard_frames(settle);
     return ESP_OK;
 }
 
@@ -169,6 +259,50 @@ static void camera_stop(void)
 {
     esp_camera_deinit();
     vTaskDelay(pdMS_TO_TICKS(100));
+}
+
+/* Fold a closed streaming-duty segment into the bank-keeper EMA (scale:
+ * DUTY_SCALE = 100%, time constant DUTY_TAU_MS). Segments longer than the
+ * time constant saturate the estimate — exact math is pointless past that. */
+static uint32_t duty_ema_advance(uint32_t ema, bool active, int64_t elapsed_ms)
+{
+    if (elapsed_ms <= 0) return ema;
+    if (elapsed_ms >= DUTY_TAU_MS) return active ? DUTY_SCALE : 0;
+    uint64_t fold = (uint64_t)(active ? DUTY_SCALE - ema : ema)
+                    * (uint64_t)elapsed_ms / DUTY_TAU_MS;
+    return active ? (uint32_t)(ema + fold) : (uint32_t)(ema - fold);
+}
+
+/* Absolute scene luma for the night bank-keeper: zone_result_t.global_mean is
+ * the mean DIFFERENCE (0 = static scene, day or night), not light level.
+ * Stride 7 over the grayscale frame = 2700 samples per QQVGA: negligible. */
+static int frame_mean_luma(const uint8_t *px, size_t len)
+{
+    unsigned sum = 0; size_t n = 0;
+    for (size_t i = 0; i < len; i += 7) { sum += px[i]; n++; }
+    return n ? (int)(sum / n) : 0;
+}
+
+/* Park/unpark the sensor's own streaming via its datasheet standby bit,
+ * leaving esp_camera, SCCB and the DVP receiver up — register contents are
+ * retained on both supported sensors, so a window re-opens with just a
+ * set_reg plus discarded wake frames:
+ *   OV3660: SYSTEM_CTROL0 (0x3008) bit6 — verified on this device in the
+ *     night-gate work: ~1.5 mA parked vs 22-38 mA while streaming.
+ *   OV2640: COM2 (0x3009) bit4 — datasheet: standby keeps all register
+ *     content, DVP stops. set_reg() takes (bank<<8)|addr for OV2640, so
+ *     0x3009 is bank 0, reg 0x09; the driver does the bank switch.
+ * Returns ESP_OK, ESP_ERR_NOT_SUPPORTED (no known standby bit), or a driver
+ * error. */
+static esp_err_t sensor_set_parked(bool parked)
+{
+    sensor_t *s = esp_camera_sensor_get();
+    if (!s || !s->set_reg) return ESP_ERR_NOT_SUPPORTED;
+    int reg, mask, val;
+    if (s->id.PID == OV3660_PID)      { reg = 0x3008; mask = 0x40; val = parked ? 0x40 : 0x00; }
+    else if (s->id.PID == OV2640_PID) { reg = 0x3009; mask = 0x10; val = parked ? 0x10 : 0x00; }
+    else return ESP_ERR_NOT_SUPPORTED;
+    return s->set_reg(s, reg, mask, val) == 0 ? ESP_OK : ESP_FAIL;
 }
 
 static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
@@ -475,6 +609,19 @@ static void video_stream_session(const char *sid, const char *skind, int max_fra
     heap_caps_free(buf);
 }
 
+/* One failure policy for getting back into probe mode (after a photo-mode
+ * switch, a failed unpark, or at boot): try, and on failure tear the driver
+ * down and retry every 2 s until it works. zone_motion_reset on a zeroed
+ * zone is safe, so the boot path can use this too. */
+static void probe_restart_or_halt(void)
+{
+    while (probe_start() != ESP_OK) {
+        ESP_LOGE(TAG, "probe mode failed, retrying in 2 s");
+        vTaskDelay(pdMS_TO_TICKS(2000));
+        camera_stop();
+    }
+}
+
 /* Switch to photo mode, grab and upload one XGA JPEG, switch back to probe. */
 static bool capture_photo(const char *why, const zone_result_t *r)
 {
@@ -520,11 +667,7 @@ static bool capture_photo(const char *why, const zone_result_t *r)
     }
 
     camera_stop();
-    while (probe_start() != ESP_OK) {
-        ESP_LOGE(TAG, "probe mode failed, retrying in 2 s");
-        vTaskDelay(pdMS_TO_TICKS(2000));
-        camera_stop();
-    }
+    probe_restart_or_halt();
     return ok;
 }
 
@@ -615,18 +758,96 @@ void app_main(void)
     ESP_ERROR_CHECK(nvs_flash_init());
     wifi_init(); /* radio off until a capture dials it */
 
-    while (camera_start(PROBE_PIXFORMAT, PROBE_FRAMESIZE, 0, PROBE_SETTLE) != ESP_OK) {
-        ESP_LOGE(TAG, "camera init failed, retrying in 2 s");
-        vTaskDelay(pdMS_TO_TICKS(2000));
-        camera_stop();
-    }
-    ESP_LOGI(TAG, "probing at %.1f fps, heartbeat %d ms, wifi=dial-before-call", 1000.0f / PROBE_INTERVAL_MS, HEARTBEAT_MS);
+    probe_restart_or_halt();
+    ESP_LOGI(TAG, "probe loop: continuous while hot, windowed idle=%d ms x%d frames hot-hold=%d ms, heartbeat %d ms, wifi=dial-before-call, sensor-parking=%s",
+             PROBE_IDLE_MS, WINDOW_FRAMES, PROBE_HOT_HOLD_MS, HEARTBEAT_MS,
+             INCREASE_POWER_CONSUMPTION ? "DISABLED (INCREASE_POWER_CONSUMPTION)" : "enabled");
 
-    int64_t last_capture_ms = esp_timer_get_time() / 1000;
+    int64_t last_capture_ms = now_ms();
     int64_t last_live_poll_ms = last_capture_ms;
     unsigned captures = 0, skips = 0, skip_streak = 0;
 
+    /* Windowed idle state (see PROBE_IDLE_MS). Duty accounting is the field
+     * power gauge: active = sensor streaming, parked = sensor standby.
+     * 'parked' is the ONE sensor-state flag — the gauge derives streaming
+     * from it; never cache a second copy of that fact. */
+    bool can_window = !INCREASE_POWER_CONSUMPTION, parked = false, night = false;
+    bool bank_hold = false;
+    int window_left = 0, dark_run = 0, park_fails = 0;
+    int64_t hot_until_ms = 0, park_until_ms = 0;
+    int64_t mode_since_ms = now_ms();
+    uint32_t windows = 0;
+    uint32_t duty_ema = 0; /* scale DUTY_SCALE=100%; starts at 0 = keeper engaged at boot */
+    uint64_t active_ms = 0, parked_ms = 0;
+
+    /* Steady-state precheck (PLAN 5c-1f defect): a cold scene windowed with
+     * the current knobs can only reach win_duty = active/(active+PROBE_IDLE_MS)
+     * streaming. If that ceiling sits under the engage floor, releasing
+     * bank_hold just re-latches a minute later — an endless HOLD/RESUME
+     * oscillation that parks/unparks and wakes the sensor every cycle while
+     * logging both edges. So: if windowing cannot hold this bank, the keeper
+     * latches ONCE and holds until reboot; retune PROBE_IDLE_MS (and/or
+     * WINDOW_FRAMES) so window duty clears MIN_DUTY_PCT before expecting
+     * savings from a flag=0 build. */
+    const int64_t win_active_ms = (int64_t)(PROBE_SETTLE + WINDOW_FRAMES) * PROBE_INTERVAL_MS;
+    const uint32_t win_duty = (uint32_t)((uint64_t)win_active_ms * DUTY_SCALE /
+                                         (win_active_ms + PROBE_IDLE_MS));
+    const bool window_clears_floor = win_duty >= DUTY_SCALED(MIN_DUTY_PCT);
+
+    /* Fold the just-closed streaming/parked segment into the gauge and the
+     * keeper EMA. Called exactly once BEFORE every parked mutation; the
+     * current parked value identifies which segment closed, so there is no
+     * second mode flag to keep in sync. */
+#define MODE_CLOSE() do {                                              \
+        int64_t t_ = now_ms();                                         \
+        if (!parked) active_ms += t_ - mode_since_ms;                  \
+        else parked_ms += t_ - mode_since_ms;                          \
+        duty_ema = duty_ema_advance(duty_ema, !parked, t_ - mode_since_ms); \
+        mode_since_ms = t_;                                            \
+    } while (0)
+
+    /* THE idle policy in one place: why are we forcing continuous streaming
+     * right now (NULL = windowing/parking allowed). A new hold reason gets
+     * added HERE and every decision site picks it up. Call sites pass
+     * deliberately different clock snapshots on purpose: frame-time answers
+     * "was the zone hot during this frame"; iter-end answers "is a hold
+     * still live after an upload that consumed seconds". */
+#define HOLD_REASON(now) (!can_window ? "no-park" : night ? "night" : \
+                          bank_hold ? "duty-floor" :                    \
+                          (now) < hot_until_ms ? "hot" : NULL)
+
     while (true) {
+        /* While parked, wait out PROBE_IDLE_MS; then open a window: unpark,
+         * discard wake frames, and probe normally for WINDOW_FRAMES frames. */
+        int64_t loop_start_ms = now_ms();
+        if (parked) {
+            if (loop_start_ms < park_until_ms) {
+                vTaskDelay(pdMS_TO_TICKS(100));
+                continue;
+            }
+            bool wake_ok = sensor_set_parked(false) == ESP_OK &&
+                           discard_frames(PROBE_SETTLE);
+            if (!wake_ok) {
+                ESP_LOGE(TAG, "sensor unpark failed, re-initializing camera");
+                camera_stop();
+                probe_restart_or_halt();
+                MODE_CLOSE(); /* was parked; re-init streams again */
+                parked = false;
+                window_left = 0;
+                continue;
+            }
+            MODE_CLOSE(); /* closing the parked segment */
+            parked = false;
+            windows++;
+            window_left = WINDOW_FRAMES;
+        } else if (!HOLD_REASON(loop_start_ms) && window_left == 0) {
+            /* Hot-hold expired with the sensor still streaming (e.g. after a
+             * capture): resume windows without a park cycle first. */
+            windows++; /* every detection-window open counts: windows= is a
+                        * detection duty gauge, not a park-cycle counter */
+            window_left = WINDOW_FRAMES;
+        }
+
         camera_fb_t *fb = esp_camera_fb_get();
         if (!fb) {
             ESP_LOGE(TAG, "probe grab failed");
@@ -658,8 +879,41 @@ void app_main(void)
         }
 
         zone_result_t r = zone_motion_update(&s_zone, fb->buf, w);
-        const int64_t now_ms = esp_timer_get_time() / 1000;
-        const int64_t since_ms = now_ms - last_capture_ms;
+        const int64_t frame_ms = now_ms();
+        const int64_t since_ms = frame_ms - last_capture_ms;
+
+        if (r.hot_cells > 0) {
+            /* Anything moving inside the zone: probe continuously while it
+             * does. The 5a trigger pipeline (150 ms frames, 2 consecutive)
+             * runs untouched for the whole hot-hold. */
+            hot_until_ms = frame_ms + PROBE_HOT_HOLD_MS;
+        }
+
+        /* Night state machine runs UNCONDITIONALLY. It gates two things:
+         * sensor parking (meaningful only when can_window) and the capture
+         * decision (always). Gating it on can_window — as the pre-merge
+         * cleanup did — made it dead code in the shipped flag=1 build, and
+         * the pole then uploaded black frames all night (field report
+         * 2026-11-08: 33 photos with mean luma 10-40; the only "motion"
+         * after dark is traffic). Thresholds are the 5d night-gate
+         * measurements: real night scenes land 9-30, day ~135, headlight
+         * frames sit near the night floor, so a passing car never opens
+         * the gate. */
+        const int luma = frame_mean_luma(fb->buf, fb->len);
+        if (!night) {
+            dark_run = luma < NIGHT_LUMA_ENTER ? dark_run + 1 : 0;
+            if (dark_run >= NIGHT_DARK_FRAMES) {
+                night = true;
+                ESP_LOGI(TAG, "night: luma=%d under %d for %d frames: captures off%s",
+                         luma, NIGHT_LUMA_ENTER, NIGHT_DARK_FRAMES,
+                         can_window ? ", windowing off (bank-keeper)" : "");
+            }
+        } else if (luma >= NIGHT_LUMA_EXIT) {
+            night = false;
+            dark_run = 0;
+            ESP_LOGI(TAG, "night: dawn luma=%d: captures resume%s", luma,
+                     can_window ? ", windowing resumes" : "");
+        }
 
         bool shoot = false;
         const char *why = NULL;
@@ -669,10 +923,15 @@ void app_main(void)
          * HEARTBEAT_MS, not by this. */
         const int backoff_exp = (int)skip_streak > SKIP_BACKOFF_MAX ? SKIP_BACKOFF_MAX : (int)skip_streak;
         const int64_t motion_gap_ms = (int64_t)REFRACTORY_MS << backoff_exp;
-        if (r.trigger && since_ms >= motion_gap_ms) {
+        /* Darkness gate: while the scene reads dark, neither motion nor the
+         * heartbeat takes a photo. Detection and the luma watch keep
+         * streaming (the bank-keeper wants that load anyway), so dawn
+         * reopens this gate by itself — last_capture_ms only fell behind,
+         * which makes the first dawn trigger fire at once. */
+        if (!night && r.trigger && since_ms >= motion_gap_ms) {
             shoot = true;
             why = "motion";
-        } else if (HEARTBEAT_MS > 0 && since_ms >= HEARTBEAT_MS) {
+        } else if (!night && HEARTBEAT_MS > 0 && since_ms >= HEARTBEAT_MS) {
             shoot = true;
             why = "heartbeat";
         }
@@ -686,9 +945,12 @@ void app_main(void)
                 esp_camera_fb_return(fb);
                 fb = NULL;
                 capture_photo(why, &r);
-                last_capture_ms = esp_timer_get_time() / 1000;
+                last_capture_ms = now_ms();
                 captures++;
                 skip_streak = 0;
+                /* A capture means wildlife: keep the fresh streaming sensor
+                 * continuous for a hot-hold (capture_photo left it running). */
+                hot_until_ms = last_capture_ms + PROBE_HOT_HOLD_MS;
             } else {
                 /* No IP: advance the timestamp anyway so the retry respects
                    the backoff, and reset the reference frame: it went stale
@@ -696,7 +958,7 @@ void app_main(void)
                 ESP_LOGW(TAG, "%s capture skipped: wifi not up", why);
                 esp_camera_fb_return(fb);
                 fb = NULL;
-                last_capture_ms = esp_timer_get_time() / 1000;
+                last_capture_ms = now_ms();
                 skips++;
                 if (skip_streak < SKIP_BACKOFF_MAX) skip_streak++;
                 zone_motion_reset(&s_zone);
@@ -704,13 +966,78 @@ void app_main(void)
             wifi_power_down();
         } else {
             if (s_zone.frames % LOG_EVERY_FRAMES == 0) {
-                ESP_LOGI(TAG, "probing: frames=%u captures=%u skips=%u last hot=%d global=%d",
-                         (unsigned)s_zone.frames, captures, skips, r.hot_cells, r.global_mean);
+                /* The field power gauge must include the currently open mode
+                 * segment: closed-segments-only duty goes stale exactly during
+                 * long holds, which is when the hold reasons matter. */
+                const int64_t t = now_ms();
+                uint64_t da = active_ms, dp = parked_ms;
+                if (!parked) da += t - mode_since_ms; else dp += t - mode_since_ms;
+                uint64_t total_ms = da + dp;
+                const char *hold = HOLD_REASON(t);
+                ESP_LOGI(TAG, "probing: frames=%u captures=%u skips=%u windows=%u duty=%u%% hold=%s last hot=%d global=%d",
+                         (unsigned)s_zone.frames, captures, skips, (unsigned)windows,
+                         total_ms ? (unsigned)(100 * da / total_ms) : 100,
+                         hold ? hold : "none", r.hot_cells, r.global_mean);
             }
             esp_camera_fb_return(fb);
             fb = NULL;
             if (LIVE_POLL_MS > 0 && now_ms - last_live_poll_ms >= LIVE_POLL_MS) {
                 maybe_live_poll(&last_live_poll_ms);
+            }
+        }
+
+        /* Window pacing: continuous while any hold reason is live (single
+         * source: HOLD_REASON); otherwise count the window frames down and
+         * park the sensor once the zone is cold. */
+        const int64_t iter_end_ms = now_ms();
+        if (can_window) {
+            /* Bank-keeper (slow feedback half; the night luma block above is
+             * the fast feed-forward half): project the open duty segment and
+             * latch the hold with hysteresis, so a cold idle never sits under
+             * the bank cutoff. Scale/thresholds: DUTY_SCALED / DUTY_PCT. */
+            uint32_t dema = duty_ema_advance(duty_ema, !parked, iter_end_ms - mode_since_ms);
+            if (!bank_hold && dema < DUTY_SCALED(MIN_DUTY_PCT)) {
+                bank_hold = true;
+                if (window_clears_floor) {
+                    ESP_LOGI(TAG, "bank keeper: duty %u%% under floor %d%%, holding continuous",
+                             DUTY_PCT(dema), MIN_DUTY_PCT);
+                } else {
+                    ESP_LOGI(TAG, "bank keeper: windowed duty caps at %u%% under floor %d%%: holding continuous until reboot (set INCREASE_POWER_CONSUMPTION=1 or retune PROBE_IDLE_MS=%d -> window duty >= %d%%)",
+                             DUTY_PCT(win_duty), MIN_DUTY_PCT, PROBE_IDLE_MS, MIN_DUTY_PCT);
+                }
+            } else if (bank_hold && window_clears_floor &&
+                       dema >= DUTY_SCALED(MIN_DUTY_PCT + DUTY_HYST_PCT)) {
+                bank_hold = false;
+                ESP_LOGI(TAG, "bank keeper: duty %u%% recovered, windowing resumes",
+                         DUTY_PCT(dema));
+            }
+        }
+        if (HOLD_REASON(iter_end_ms)) {
+            window_left = 0;
+        } else if (window_left > 0) {
+            window_left--;
+            if (window_left == 0 && can_window) {
+                esp_err_t pk = sensor_set_parked(true);
+                if (pk == ESP_OK) {
+                    park_fails = 0;
+                    MODE_CLOSE(); /* closing the streaming segment */
+                    parked = true;
+                    park_until_ms = iter_end_ms + PROBE_IDLE_MS;
+                } else if (pk == ESP_ERR_NOT_SUPPORTED) {
+                    can_window = false;
+                    ESP_LOGW(TAG, "sensor has no standby bit: staying on continuous probe");
+                } else if (++park_fails >= 3) {
+                    /* Degraded SCCB (connector corrosion, ribbon fatigue) is a
+                     * fault, not a feature: after 3 straight failures stop
+                     * paying a failed bus transaction per window and stop the
+                     * warn/re-init storm — continuous streaming is the
+                     * field-proven known-good state. One log, then quiet. */
+                    can_window = false;
+                    ESP_LOGE(TAG, "sensor park failed %d times (%s): falling back to continuous probe",
+                             park_fails, esp_err_to_name(pk));
+                } else {
+                    ESP_LOGW(TAG, "sensor park failed: %s", esp_err_to_name(pk));
+                }
             }
         }
         vTaskDelay(pdMS_TO_TICKS(PROBE_INTERVAL_MS));

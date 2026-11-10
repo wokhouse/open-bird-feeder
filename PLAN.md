@@ -8,7 +8,9 @@ On-device bird/no-bird model gates capture.
 
 ## Architecture
 
-Device: OV2640/OV3660 grayscale QQVGA probe frames at ~6.6 fps -> zone motion
+Device: OV2640/OV3660 grayscale QQVGA probe frames at ~6.6 fps while the zone is
+hot; a cold zone parks the sensor between ~1.5 s detection windows (5c step 1b)
+-> zone motion
 detector (firmware/main/zone_motion.c) -> on zone change (debounced, refractory
 4 s): capture XGA JPEG -> HTTP POST photo + the probe frame that triggered it +
 cell scores. Heartbeat photo every 15 min as fallback / liveness.
@@ -110,18 +112,178 @@ JEV_BIRD_P, default threshold P(bird) >= 0.5).
       streak, cap 128 s); stale reference frame reset (skips= counter in
       logs). Review-clean build on bingbong (bin 0.96 MB, 68% app partition
       free). FLASH + bank-gauge measurement pending — flashing in the am.
-      STATUS 2026-11-02: flashed and running from a 5000 mAh battery (device
-      xiao-1e85fc uploading since 09:43). Capture activity measured from
-      labels.db: 24 photo+probe pairs in 28.9 min = ~50 photos/hour (gate
-      fires often; likely moving leaves). Runtime ESTIMATE, not measured:
-      5000 mAh = 18.5 Wh, ~16 Wh usable through the 5V path; probe-mode draw
-      with Wi-Fi off between captures ≈ 1.0-1.4 W (pre-5c 1.3-1.7 W minus the
-      0.2-0.3 W Wi-Fi saving) → ~11-16 h, i.e. half a day. Capture rate is
-      noise in that number (see key fact above); 5000 mAh is structurally too
-      small for multi-day operation on this architecture — PIR + deep sleep
-      (step 2) is the fix. Bank low-load auto-off will NOT trip here
-      (~200 mA at 5V >> the ~50 mA cutoff). MEASURE: note bank % now, again
-      after N hours, draw_W = bank_Wh x pct/100 / N.
+   1b. Sensor-park windowed idle: IMPLEMENTED 2026-11-07 (branch
+      power-consumption-review; build 1.01 MB, 68% partition free, host
+      detector tests pass; flash + field A/B pending). Whole-app power audit
+      verdict: the sensor + DVP stream free-running all day is the dominant
+      daytime draw (Seeed forum: ~90 mA board floor after camera init vs 2-3
+      mA uninitialized; board ready-to-operate floor 5V@38.3 mA; LDO means
+      3.3V-side savings x1.51 at the bank). A fleet of read-only subagent
+      audits (camera driver / CPU-PM / wifi / detector / board+measurement)
+      ranked the levers; detector CPU (<2 mW), grab rate, fb layout, probe
+      size are all rounding errors — do not chase those. This step parks the
+      sensor between windows with its standby register, no esp_camera_deinit
+      (SCCB + DVP receiver stay up, registers retained): OV3660 SYSTEM_CTROL0
+      0x3008 bit6 (measured on this device: 1.5 mA parked vs 22-38 mA
+      streaming), OV2640 COM2 0x3009 bit4 (datasheet register-retentive
+      standby) — sensor_set_parked() in main.c picks by s->id.PID. Window =
+      unpark -> discard 2 wake frames -> 2 probe frames -> park;
+      PROBE_IDLE_MS=1500 between windows (est. ~25-40% sensor duty, NOT
+      measured). Any hot cell extends a 2.5 s continuous hot-hold, so
+      wildlife always runs the untouched 5a trigger pipeline; only the
+      empty-feeder phase duty-cycles. Unpark failure self-heals via full
+      camera re-init; sensors without a known standby bit stay on the old
+      continuous loop. No field ammeter: the "probing:" log line now reports
+      windows + active-vs-parked duty %, and /api/stats capture counts A/B
+      the quality. Desk-verified 2026-11-07 (14.5 min run): cold scene sat
+      at duty=15% / 148 windows in the first 5 min; 8 motion captures ran
+      the full dial -> upload -> hot-hold path, zero upload failures, zero
+      faults; duty% climbs only while the zone is actually busy. Caveat for
+      the pole: hot-hold extends on hot_cells>0, so constant single-cell
+      ambient motion (leaves) would keep the sensor streaming — if the pole
+      logs show high duty with no captures, raise the extension threshold. Tuning knobs: PROBE_IDLE_MS / WINDOW_FRAMES /
+      PROBE_HOT_HOLD_MS in main.c. Also fixed: mDNS is in sdkconfig.defaults
+      now — it had lived only in a generated sdkconfig, so any clean build
+      would silently break sleepy.local uploads.
+   1c. Night bank-keeper: IMPLEMENTED 2026-11-07, field test tonight.
+       First field result of 1b: daytime captures great, but the battery
+       bank cuts output at night — the windowed night idle sits under the
+       bank low-load cutoff (~50 mA avg at 5V), exactly the PLAN's
+       documented bank trap (this build has no 5d night gate; that lives
+       unmerged on brightness-gate, so the pole ran windowed probing all
+       night). Fix in the probe loop: absolute frame luma via
+       frame_mean_luma() (zone_result_t.global_mean is a DIFFERENCE, not
+       light level — first attempt using it was wrong), sustained <40
+       (threshold verified in 5d's night-gate tests; AEC lifts real night
+       scenes to the 20s-30s) for 30 detection frames (~50 s) = night ->
+       windowing disabled, continuous probing restores the ~0.3-0.4 W
+       full-stream load that kept banks alive pre-5c. Any frame >= 60
+       (hysteresis) = dawn -> windowing resumes. Night cost ~4-5 Wh —
+       intentional load; day savings untouched. If a bank has a
+       low-current keep-on mode, that's the zero-waste alternative; and
+       if the bank was actually DRY (not tripped), more night load makes
+       things worse, not better — check which it was.
+       1d. Bank-keeper duty floor (DAY): IMPLEMENTED + desk-verified
+        2026-11-07/08. Field follow-up: the bank trips on cold windowed
+        DAYS too (empty feeder = 15% duty is under its low-load cutoff).
+        The probe loop now tracks streaming duty with an EMA (scaled
+        256=100%, tau=120 s ~ bank trip timers); below MIN_DUTY_PCT=45%
+        parking is skipped ("bank keeper: duty N% under floor, holding
+        continuous") until projected duty recovers past 55%
+        ("windowing resumes"). Busy scenes clear the floor by themselves —
+        only the cold idle pays. Verified cycle on desk: boot hold ->
+        release at 67%/t+84 s -> 85 windows of savings -> re-latch at
+        44%/t+287 s -> re-release; cumulative duty pinned at 50%
+        (≈88 mA at 5V, above any common bank cutoff); motion captures and
+        hot-holds unaffected. First flash had a units bug (pct<<8 vs
+        pct*2.56 — keeper latched forever); caught by the on-device test,
+        fixed before this commit. Cost reality: a day at 50% duty is
+        close to the pre-5c draw — keeping a low-load-tripping bank awake
+        costs that; the zero-waste alternative stays a bank with a
+        low-current keep-on mode (or no auto-off at all).
+   1e. INCREASE_POWER_CONSUMPTION compile flag: IMPLEMENTED + verified
+       2026-11-08. The field answer beat more tuning: this pole's bank
+       STILL tripped at the 45% duty floor. The flag (default 1 for this
+       bank) means the sensor is NEVER parked — no windowing, no keeper
+       logic fires; plain continuous probe, i.e. the pre-5c load that
+       always kept banks awake. All other power work (dial-before-call,
+       capture pipeline) stays on, and the whole windowed/keeper
+       machinery stays compiled and armed: set the flag to 0 when a
+       bank without low-load auto-off is fitted and the savings return.
+       User asked for maximum simplicity — one flag, one line disables
+       the parking path (can_window init), keeper trigger gated on
+       can_window so its logs go silent too. Verified on-device: zero
+       park/keeper lines, zero wake noise, duty=100%, captures still
+       uploading, zero faults. Daytime draw is now ~130 mA at 5 V by
+       design; the bank, not the firmware, remains the constraint.
+       (The night path was NOT gated as of this step — fixed in 1f.)
+   1f. Pre-merge review cleanup (4-reviewer fan-out, 2026-11-08):
+       applied, behavior-preserving: the night luma state-machine is now
+       gated on can_window (it previously ran and logged "night:
+       bank-keeper on"/"dawn detected" claims even with the flag=1
+       build, contradicting 1e); the hold decision is one named source
+       (HOLD_REASON: night|duty-floor|hot|no-park) consulted at both
+       decision points, replacing the duplicated De-Morgan'd predicate
+       and the half-running window churn under flag=1; the probing
+       gauge now includes the open mode segment (duty= was stale during
+       long holds — wrong exactly when keepers act) and logs hold=<reason>
+       instead of keeper=0/1, so the field can see WHICH hold is active;
+       shared helpers replace three copies of the probe-restart loop and
+       two same-value settle macros (now_ms(), discard_frames(),
+       PROBE_SETTLE); clock snapshots renamed for honesty
+       (loop_start_ms/frame_ms/iter_end_ms — they are deliberately
+       different: uploads consume seconds); misleading comments fixed
+       (night luma is whole-frame mean NOT zone mean; ~50s claim was
+       mode-dependent ~4.5-35 s; "20s-30s" was luma values).
+       Deferred to a post-merge follow-up (verified behavior, don't
+       disturb pre-merge): the day duty-floor has no steady state with
+       current knobs — windowed duty ≈28% < 45% floor means HOLD/RESUME
+       oscillation every ~70-90 s in a flag=0 build (reviewer simulated
+       the fixed-point loop; matches the 84s→287s→320s desk pattern);
+       duty_ema integer folds truncate; unify the three latches into one
+       per-iteration mode decision; SCCB park-failure fallback; the
+       windows= counter mixes two window kinds. Re-run 5c-1b desk
+       verification before ever setting the flag to 0.
+       -> ALL FIVE ADDRESSED IN 1g (branch flag0-power-followups).
+   1g. Flag=0 follow-ups: IMPLEMENTED + desk-verified 2026-11-08.
+       (1) Duty math moved to Q16 (DUTY_SCALE/DUTY_SCALED/DUTY_PCT
+       macros, scale 65536=100%): Q8 folds of real 150-1500 ms segments
+       truncated asymmetrically, so the old controller drifted below its
+       own math. Proof of accuracy: on-device release fired at exactly
+       the computed 55% (t=67.7 s; host sim of the exact integer loop
+       predicted 66 s) and re-latch at 44%.
+       (2) Steady-state precheck: window ceiling duty =
+       (PROBE_SETTLE+WINDOW_FRAMES)*PROBE_INTERVAL_MS / (that +
+       PROBE_IDLE_MS) is computed once at boot. If the ceiling is under
+       MIN_DUTY_PCT (it is: 28% vs 45% with shipped knobs), releasing
+       bank_hold only re-latches a minute later — so the keeper latches
+       ONCE and holds continuous until reboot, with a log naming the
+       ceiling and the retune needed. The ~70-90 s oscillation cannot
+       happen anymore.
+       (3) 'parked' is now the ONE sensor-state flag: mode_active
+       deleted, MODE_CLOSE() folds the gauge/EMA before every parked
+       mutation (no second flag to desync).
+       (4) Degraded SCCB: 3 consecutive set_reg park failures =>
+       windowing off with ONE error log (was: warn every ~2 s forever
+       + re-init storm); continuous streaming is the fallback.
+       (5) windows= counts every detection-window open (unpark AND
+       hot-expiry resume) — detection duty gauge, not park cycles.
+       On-device test build (NOT shipped: flag=0, PROBE_IDLE_MS=400,
+       LOG_EVERY_FRAMES=100): boot hold -> release at 55% -> windowing
+       ran (windows 1->135, wake FB-SIZE noise normal, 4 captures
+       uploaded, zero park/unpark/grab faults) -> one margin-cycle
+       re-latch at 44% -> released again at 55%. Lesson for any real
+       flag=0 deploy: bench window cycles run ~1.0-1.5 s wall (SCCB
+       wake + 100 ms wait granularity), so measured window duty lands
+       near the floor with IDLE=400 — pick PROBE_IDLE_MS so the FIELD
+       'probing:' duty sits clearly above MIN_DUTY_PCT, else keep
+       flag=1. Board returned to the shipped flag=1 build and re-flashed.
+   1h. Darkness gate on CAPTURES: IMPLEMENTED 2026-11-08 (field defect).
+       Field report: the pole uploaded 33 photos whose stored JPEGs measure
+       mean luma 10-40 (server-side measurement over the last 4 days of
+       data/photo; 21 of them after 17:21 local on 11-08 while the scene
+       went dark). Nothing in the shipped build ever gated captures on
+       light: 5c-1c's night luma state machine only disables sensor
+       PARKING, and 5c-1f gated that block on can_window — so in the
+       flag=1 build it did not run at all. After dark the only zone
+       "motion" left is traffic, and its photos are black.
+       Fix: the luma state machine runs unconditionally (one 2700-sample
+       strided pass per probe frame — negligible), and the shoot decision
+       is gated on !night for BOTH the motion and the heartbeat path.
+       Thresholds unchanged: enter <40 sustained (NIGHT_DARK_FRAMES=30 =
+       ~4.5 s while streaming), exit >=60; measured night 9-30, day ~135,
+       headlight frames sit near the night floor, so a passing car cannot
+       open the gate. Night/dawn logs now name what they actually do
+       ("captures off", windowing clause only when the build can window),
+       and HOLD_REASON reports "no-park" first so the flag=1 gauge stops
+       claiming "night" is acting.
+       Deliberate scope: this is NOT the 5d deep-sleep night gate (still
+       unmerged on brightness-gate). This bank wants continuous load, so
+       the probe loop keeps streaming all night; only the photos stop —
+       and with them the night probe frames, which ride the same shoot
+       path. Field check with no console: uploads stop ~5 s after the
+       scene goes dark and resume on the first trigger once luma >= 60.
+       Not flashed here (no board on this box); built on bingbong.
    2. PIR wake + deep sleep (the trail-cam architecture): deep-sleep until the
       PIR fires, then run the existing probe+capture loop, idle-timeout back to
       sleep. Weeks per bank. Two hardware catches: the PIR must see the tray
