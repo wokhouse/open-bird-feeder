@@ -382,6 +382,28 @@ JEV_BIRD_P, default threshold P(bird) >= 0.5).
    7b (next): review UI plays /files/video/... clips; video rows in
    /api/images additive; consider auto-discard of no-bird clips (the still
    verdict already exists per event) to cut storage.
+   STATUS 2026-11-09: 7a implemented on BOTH sides. Ingest (b9c64d4)
+   verified end-to-end on a throwaway instance (quiet-stop 204, frame-cap,
+   abandoned-session sweep; exact MP4 frame counts; photo queue untouched).
+   Firmware: capture_video_burst in main.c, builds clean on bingbong
+   (birdcam.bin 1.01 MB, 68% app free). Awaiting: live-service restart +
+   device flash + field test of one real motion event.
+   7c LIVE VIEW (decided 2026-11-09): a Watch-Live button, NOT an
+   always-on stream. Power from phase 5: the 0.91 W probe floor is mostly
+   the dial-before-call saving (0.2-0.3 W); a live viewer needs an
+   associated radio anyway, so the honest cost is radio idle
+   (~50-70 mA modem-sleep) ONLY while a watch is armed. Design: the Pi
+   owns the watch state (POST /api/live_arm {device, minutes}; re-arm
+   from the UI while the player is open; expiry auto-disarms). The
+   device learns of an armed watch from a new header on its NEXT upload
+   response (X-Live: on/off) — zero extra requests, no device HTTP
+   server change, works with dial-before-call. While armed, the device
+   posts frames to /upload?kind=live (VGA q low, ~5 fps; NOT stored)
+   and the Pi relays them to the browser via GET /live.mjpg (chunked
+   multipart), so the browser never needs direct device reach
+   (tailnet-safe). Device streams until an upload says live is off or
+   the stream window ends, then back to probe. Live frames are not
+   recorded; recordings stay motion-gated (7a).
 
 Decision at end of Phase 3 (alt): stream probes to Pi for a real detector instead
 of on-device model — pipeline is the same either way.

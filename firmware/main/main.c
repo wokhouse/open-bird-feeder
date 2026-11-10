@@ -25,6 +25,7 @@
 #include "esp_camera.h"
 #include "esp_err.h"
 #include "esp_event.h"
+#include "esp_heap_caps.h" /* ps_malloc: put the video chunk buffer in PSRAM */
 #include "esp_http_client.h"
 #include "esp_log.h"
 #include "esp_mac.h"
@@ -68,6 +69,18 @@ static const char *TAG = "birdcam";
 #define PHOTO_FRAMESIZE   FRAMESIZE_XGA /* 1024x768 */
 #define PHOTO_JPEG_QUALITY 12
 #define PHOTO_SETTLE      3 /* let auto-exposure converge after the mode switch */
+
+/* Phase 7a: motion captures also stream a clip to the Pi (no encoder or
+ * storage on the device — raw JPEG frames, the Pi detects the quiet and
+ * encodes). The device-side caps are safety limits; the Pi's zone
+ * detector (same zone_motion.c, same zone_config.h) decides when a clip
+ * really ends and says so with HTTP 204. Keep VIDEO_MAX_FRAMES in sync
+ * with ingest/video.py's default: at that exact count both sides stop on
+ * the same chunk. */
+#define VIDEO_MAX_FRAMES      100           /* 20 s at VIDEO_FRAME_MS pacing */
+#define VIDEO_FRAME_MS        200           /* 5 fps; Pi encodes at this rate */
+#define VIDEO_CHUNK_FRAMES    5             /* one POST per chunk (~330 KB) */
+#define VIDEO_CHUNK_MAX_BYTES (700 * 1024)  /* flush early if frames are big */
 
 #define REFRACTORY_MS 4000  /* ignore motion this long after a capture */
 #define HEARTBEAT_MS  900000 /* 15 min: one photo when nothing moves (0 = off) */
@@ -244,12 +257,13 @@ static void wifi_power_down(void)
     }
 }
 
-/* POST a buffer to the ingest service. hot/global < 0 = no motion headers.
+/* POST a buffer to the ingest service; returns the HTTP status code,
+ * 0 = transport failure. hot/global < 0 = no motion headers.
  * grid non-NULL = also send it as X-Motion-Grid (probe frames only).
- * Returns true on HTTP 200. */
-static bool upload_bytes(const uint8_t *buf, size_t len, const char *kind,
-                         const char *content_type, int hot, int global,
-                         const char *grid)
+ * vsid non-NULL = also send X-Video-Session/X-Video-Seq (video chunks). */
+static int upload_http(const uint8_t *buf, size_t len, const char *kind,
+                       const char *content_type, int hot, int global,
+                       const char *grid, const char *vsid, int vseq)
 {
     char url[128];
     snprintf(url, sizeof(url), "%s/upload?kind=%s", INGEST_BASE, kind);
@@ -260,7 +274,7 @@ static bool upload_bytes(const uint8_t *buf, size_t len, const char *kind,
         .timeout_ms = 10000,
     };
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
-    if (!client) return false;
+    if (!client) return 0;
 
     char num[16];
     esp_http_client_set_header(client, "Content-Type", content_type);
@@ -274,18 +288,30 @@ static bool upload_bytes(const uint8_t *buf, size_t len, const char *kind,
         esp_http_client_set_header(client, "X-Motion-Global", num);
     }
     if (grid) esp_http_client_set_header(client, "X-Motion-Grid", grid);
+    if (vsid) {
+        esp_http_client_set_header(client, "X-Video-Session", vsid);
+        snprintf(num, sizeof(num), "%d", vseq);
+        esp_http_client_set_header(client, "X-Video-Seq", num);
+    }
     esp_http_client_set_post_field(client, (const char *)buf, len);
 
-    bool ok = false;
     esp_err_t err = esp_http_client_perform(client);
     int status = esp_http_client_get_status_code(client);
-    if (err == ESP_OK && status == 200) {
-        ok = true;
-    } else {
-        ESP_LOGE(TAG, "upload %s failed: err=%s status=%d", kind, esp_err_to_name(err), status);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "upload %s failed: %s", kind, esp_err_to_name(err));
+        status = 0;
+    } else if (status != 200 && status != 204) {
+        ESP_LOGE(TAG, "upload %s failed: status=%d", kind, status);
     }
     esp_http_client_cleanup(client);
-    return ok;
+    return status;
+}
+
+static bool upload_bytes(const uint8_t *buf, size_t len, const char *kind,
+                         const char *content_type, int hot, int global,
+                         const char *grid)
+{
+    return upload_http(buf, len, kind, content_type, hot, global, grid, NULL, -1) == 200;
 }
 
 /* Draw 1px white outlines on the hot cells of a grayscale probe fb, so the
@@ -367,6 +393,63 @@ static esp_err_t probe_start(void)
     return err;
 }
 
+/* Phase 7a: stream the clip while the event is still unfolding. Called
+ * right after the trigger still, camera already in photo (XGA JPEG)
+ * mode. The Pi runs the SAME zone detector on these frames and answers
+ * each chunk 200 (keep streaming) or 204 (clip over); any other answer
+ * ends the burst too — the still is already stored, and hammering a
+ * struggling link is what the probe-loop backoff exists to avoid. */
+static void capture_video_burst(void)
+{
+    char *buf = heap_caps_malloc(VIDEO_CHUNK_MAX_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!buf) {
+        ESP_LOGW(TAG, "video: no %d KB chunk buffer; clip skipped",
+                 VIDEO_CHUNK_MAX_BYTES / 1024);
+        return;
+    }
+    char sid[48];
+    snprintf(sid, sizeof(sid), "%s-%lld", s_device_id,
+             (long long)(esp_timer_get_time() / 1000000));
+
+    unsigned total = 0, chunk = 0, frames = 0;
+    size_t len = 0;
+    const char *end = "cap";
+    const int64_t t0 = esp_timer_get_time() / 1000;
+    while (total < VIDEO_MAX_FRAMES) {
+        /* one chunk, paced at VIDEO_FRAME_MS: 5 fps stays honest even
+         * when the sensor could deliver more */
+        while (frames < VIDEO_CHUNK_FRAMES && total < VIDEO_MAX_FRAMES) {
+            const int64_t due_ms = t0 + (int64_t)total * VIDEO_FRAME_MS;
+            camera_fb_t *fb = esp_camera_fb_get();
+            if (!fb) {
+                ESP_LOGW(TAG, "video: grab failed at frame %u", total);
+                end = "grab fail";
+                break;
+            }
+            if (len + fb->len <= VIDEO_CHUNK_MAX_BYTES) {
+                memcpy(buf + len, fb->buf, fb->len);
+                len += fb->len;
+                frames++;
+                total++;
+            }
+            esp_camera_fb_return(fb);
+            const int64_t now = esp_timer_get_time() / 1000;
+            if (now < due_ms) vTaskDelay(pdMS_TO_TICKS((int)(due_ms - now)));
+        }
+        if (!frames) break;
+        int status = upload_http((unsigned char *)buf, len, "video", "image/jpeg",
+                                 -1, -1, NULL, sid, (int)chunk++);
+        if (status == 204) { end = "Pi quiet-stop"; break; }
+        if (status != 200) { end = "link/err"; break; }
+        len = 0;
+        frames = 0;
+    }
+    const int64_t dur = esp_timer_get_time() / 1000 - t0;
+    ESP_LOGI(TAG, "video burst: %u frames, %u chunks, %lld ms (end=%s)",
+             total, chunk, (long long)dur, end);
+    heap_caps_free(buf);
+}
+
 /* Switch to photo mode, grab and upload one XGA JPEG, switch back to probe. */
 static bool capture_photo(const char *why, const zone_result_t *r)
 {
@@ -386,6 +469,12 @@ static bool capture_photo(const char *why, const zone_result_t *r)
         esp_camera_fb_return(fb);
     } else {
         ESP_LOGE(TAG, "%s photo: frame grab failed", why);
+    }
+
+    /* Motion events also stream the event as a clip (phase 7a);
+     * heartbeats stay single photos and keep the power profile. */
+    if (ok && strcmp(why, "heartbeat") != 0) {
+        capture_video_burst();
     }
 
     camera_stop();
