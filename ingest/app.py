@@ -35,6 +35,12 @@ Endpoints:
                                      X-Motion-Grid (probe: packed hot-cell
                                      map; stored as a .grid.json sidecar).
                                      kind=photo also queues AI review.
+  POST /upload?kind=video            streamed clip chunk (phase 7a, see
+                                     video.py): concatenated JPEG frames,
+                                     headers X-Video-Session/X-Video-Seq;
+                                     200=keep streaming, 204=clip finished.
+                                     Finished clips land in data/video/ as
+                                     MP4 + capture row kind='video'.
   GET  /api/images                   [{path,state,species,source,confidence,note,box,taken_at}]
   GET  /api/stats                    counts per state
   POST /api/set_state {path,state,species?}   manual review ('unclassified' clears)
@@ -58,9 +64,10 @@ from pathlib import Path
 
 import jev
 import notify
+import video
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 DATA = Path(os.environ.get("INGEST_DATA", Path(__file__).parent / "data")).resolve()
@@ -262,13 +269,26 @@ def save_motion_grid(path: Path, headers) -> None:
     }))
 
 
+# video sessions (phase 7a): detector is host-compiled from the firmware source
+video.init(Path(__file__).resolve().parent.parent, DATA, db, ensure_capture)
+
+
 @app.post("/upload")
 async def upload(request: Request, background_tasks: BackgroundTasks, kind: str = "photo"):
-    if kind not in ("photo", "probe"):
-        raise HTTPException(400, "kind must be photo|probe")
+    if kind not in ("photo", "probe", "video"):
+        raise HTTPException(400, "kind must be photo|probe|video")
     body = await request.body()
     if not body or len(body) > 2_000_000:
         raise HTTPException(400, f"body must be 1B..2MB, got {len(body)}")
+    for sess in video.expired_sessions():  # abandoned clips close on any traffic
+        background_tasks.add_task(video.assemble, sess)
+    if kind == "video":
+        # streamed clip chunks: the Pi-side zone detector decides the clip's
+        # end; 204 tells the device to stop, 200 to keep streaming.
+        status, finished = video.handle_video(body, request.headers)
+        for sess in finished:
+            background_tasks.add_task(video.assemble, sess)
+        return Response(status_code=status)
     device = SAFE(request.headers.get("x-device-id", "unknown"))
     ts = datetime.datetime.now()
     folder = DATA / kind / ts.strftime("%Y-%m-%d")

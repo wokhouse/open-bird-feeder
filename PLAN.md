@@ -330,6 +330,59 @@ JEV_BIRD_P, default threshold P(bird) >= 0.5).
    retry in a fresh page (3rd attempt clean), the app range logic itself is
    index-consistent at click time.
 
+7. **Bird video: motion-gated clips, encoded on the Pi** — design DONE
+   2026-11-09, code in progress. No SD card on the device: the ESP32 streams
+   the clip to sleepy, which stores and encodes it. The ESP32 has no video
+   encoder — a "video" here is a JPEG-frame burst (MJPEG) streamed over HTTP,
+   assembled to H.264 MP4 by ffmpeg on the Pi (ffmpeg 7.1 already installed).
+   Start = the existing zone-motion trigger (unchanged). Stop = the SAME
+   detector, also run on the Pi side over the streamed frames: the Pi
+   downscales each received frame to the 160x120 probe geometry and feeds it
+   to zone_motion.c compiled for the host (ctypes) — same grid, same tuned
+   thresholds, no retune. When the detector sees VIDEO_QUIET_FRAMES consecutive
+   non-motion frames it tells the device to stop via HTTP 204 (200 =
+   continue); hard cap VIDEO_MAX_SECONDS=20. That closes the user's ask:
+   the same pipeline decides when a clip starts AND when it ends.
+   Measured bench (real XGA q12 frames from data/photo, Pi4):
+   - frame p50 66 KB, p90 70 KB (n=1773, recent days); ~700 gate fires/day.
+   - 40-frame burst (8 s @ 5 fps, 2.45 MB MJPEG) -> libx264 crf28 veryfast:
+     875 KB MP4, 2.3 s wall encode. 640x480 crf30 fallback: 275 KB.
+   - So: MVP streams the SAME XGA JPEG mode the photo capture already runs
+     (zero extra camera reconfiguration), 5 fps pacing by 200 ms delays.
+     Worst case 700 clips/day: ~2.3 GB/day upload, ~0.6 GB/day MP4 storage.
+   Wire protocol (extends /upload, existing kinds untouched):
+   POST /upload?kind=video, headers X-Device-Id, X-Video-Session <id>,
+   X-Video-Seq <n>, body = concatenated JPEG frames (SOI/EOI framing; a
+   truncated tail frame is dropped). Chunk = VIDEO_CHUNK_FRAMES=5 frames
+   (~330 KB, ~1 s wall). Ingest keeps per-session state in memory, runs the
+   detector per frame, answers per chunk. On stop or idle-sweep (session
+   silent > 10 s — covers a mid-session upload failure): concatenate clean
+   frames -> ffmpeg mp4 -> data/video/<date>/HHMMSS_<device>.mp4 + capture
+   row kind='video' (schema needs no change; kind is free text). Fewer than
+   MIN_VIDEO_FRAMES=4 clean frames: drop the session. /api/images stays
+   photo-only until the review UI handles video (milestone 7b); files are
+   already served by the existing /files mount.
+   Firmware flow per motion capture (heartbeat stays photo-only): existing
+   photo path unchanged through the still upload; then, still in JPEG XGA
+   mode, stream chunks until stop/error/cap; then camera_stop + probe_start
+   (existing tail). Refractory starts after the clip ends (last_capture_ms
+   set after everything). Chunk transport failure = end session now; the Pi
+   keeps whatever arrived. PSRAM chunk buffer ~750 KB, freed after the
+   session.
+   Energy: clips are event-gated like today's uploads — ~0.5 W extra for
+   ≤20 s per event, <1 Wh/day at 700 events/day vs the ~20-30 Wh/day probe
+   baseline. Video is power-cheap precisely because the gate already dials
+   Wi-Fi.
+   MEASURE FIRST (device, not yet done): sustained ESP32 uplink — every
+   number above assumes ≥300 KB/s for ~1 s bursts. Bench = a firmware mode
+   POSTing a fixed ~2 MB buffer and timing it; if the field link is slower,
+   the escape hatch is sensor->set_framesize(VGA)+set_quality before the
+   video loop (halves payload; Pi re-encodes at VGA anyway for storage if
+   wanted).
+   7b (next): review UI plays /files/video/... clips; video rows in
+   /api/images additive; consider auto-discard of no-bird clips (the still
+   verdict already exists per event) to cut storage.
+
 Decision at end of Phase 3 (alt): stream probes to Pi for a real detector instead
 of on-device model — pipeline is the same either way.
 
