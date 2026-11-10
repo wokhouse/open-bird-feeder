@@ -70,17 +70,26 @@ static const char *TAG = "birdcam";
 #define PHOTO_JPEG_QUALITY 12
 #define PHOTO_SETTLE      3 /* let auto-exposure converge after the mode switch */
 
-/* Phase 7a: motion captures also stream a clip to the Pi (no encoder or
- * storage on the device — raw JPEG frames, the Pi detects the quiet and
- * encodes). The device-side caps are safety limits; the Pi's zone
- * detector (same zone_motion.c, same zone_config.h) decides when a clip
- * really ends and says so with HTTP 204. Keep VIDEO_MAX_FRAMES in sync
- * with ingest/video.py's default: at that exact count both sides stop on
- * the same chunk. */
-#define VIDEO_MAX_FRAMES      100           /* 20 s at VIDEO_FRAME_MS pacing */
+/* Phase 7a/7c: motion captures also stream a clip to the Pi (no encoder or
+ * storage on the device — raw JPEG frames; the Pi detects the quiet and
+ * encodes, and only keeps the clip when the event's decision model says
+ * bird). The device-side caps are safety limits; the Pi's zone detector
+ * (same zone_config.h) plus the live-window rules decide when a session
+ * really ends and say so with HTTP 204. A live window (bird verdict or
+ * browser request) makes the Pi hold 204 back, so sessions run longer
+ * than the quiet rules alone — VIDEO_MAX_FRAMES is the hard ceiling for
+ * both; keep it >= ingest/video.py's VIDEO_EXTENDED_MAX. */
+#define VIDEO_MAX_FRAMES      300           /* 60 s hard ceiling at VIDEO_FRAME_MS */
 #define VIDEO_FRAME_MS        200           /* 5 fps; Pi encodes at this rate */
 #define VIDEO_CHUNK_FRAMES    5             /* one POST per chunk (~330 KB) */
 #define VIDEO_CHUNK_MAX_BYTES (700 * 1024)  /* flush early if frames are big */
+
+/* Phase 7c: ask the gateway between captures whether anyone wants live
+ * video (model verdict or browser request — the gateway decides, this
+ * device obeys). Each poll dials the radio ~2 s: at 180000 ms that is
+ * ~0.05% duty, negligible next to the probe baseline. 0 = only learn
+ * about live windows at the next capture's response header. */
+#define LIVE_POLL_MS 180000
 
 #define REFRACTORY_MS 4000  /* ignore motion this long after a capture */
 #define HEARTBEAT_MS  900000 /* 15 min: one photo when nothing moves (0 = off) */
@@ -104,6 +113,11 @@ static volatile bool s_wifi_wanted;   /* retry connects while true */
 static volatile bool s_wifi_started;  /* esp_wifi driver is up */
 static volatile bool s_wifi_up;       /* got an ip */
 static char s_device_id[24];
+/* One id per capture cycle, sent on the trigger photo AND its video
+ * chunks: it is the join key the Pi uses to ask the decision model
+ * whether this footage is a bird. */
+static char s_event_id[64];
+static volatile int s_live_secs;  /* X-Live from the gateway's response */
 static zone_motion_t s_zone;
 static bool s_zone_ready;
 
@@ -260,10 +274,14 @@ static void wifi_power_down(void)
 /* POST a buffer to the ingest service; returns the HTTP status code,
  * 0 = transport failure. hot/global < 0 = no motion headers.
  * grid non-NULL = also send it as X-Motion-Grid (probe frames only).
- * vsid non-NULL = also send X-Video-Session/X-Video-Seq (video chunks). */
+ * event non-NULL = X-Event-Id (the capture cycle this belongs to).
+ * vsid non-NULL = video chunk: X-Event-Id vsid, X-Session-Kind skind,
+ * X-Video-Seq vseq. Any X-Live response header is recorded in
+ * s_live_secs (seconds of live streaming the gateway wants). */
 static int upload_http(const uint8_t *buf, size_t len, const char *kind,
                        const char *content_type, int hot, int global,
-                       const char *grid, const char *vsid, int vseq)
+                       const char *grid, const char *vsid, int vseq,
+                       const char *event, const char *skind)
 {
     char url[128];
     snprintf(url, sizeof(url), "%s/upload?kind=%s", INGEST_BASE, kind);
@@ -288,8 +306,10 @@ static int upload_http(const uint8_t *buf, size_t len, const char *kind,
         esp_http_client_set_header(client, "X-Motion-Global", num);
     }
     if (grid) esp_http_client_set_header(client, "X-Motion-Grid", grid);
+    if (event) esp_http_client_set_header(client, "X-Event-Id", event);
     if (vsid) {
-        esp_http_client_set_header(client, "X-Video-Session", vsid);
+        esp_http_client_set_header(client, "X-Event-Id", vsid);
+        if (skind) esp_http_client_set_header(client, "X-Session-Kind", skind);
         snprintf(num, sizeof(num), "%d", vseq);
         esp_http_client_set_header(client, "X-Video-Seq", num);
     }
@@ -303,15 +323,22 @@ static int upload_http(const uint8_t *buf, size_t len, const char *kind,
     } else if (status != 200 && status != 204) {
         ESP_LOGE(TAG, "upload %s failed: status=%d", kind, status);
     }
+    if (status == 200 || status == 204) {
+        /* IDF 5.2: esp_http_client_get_header(client, key, &value) */
+        char *lv = NULL;
+        if (esp_http_client_get_header(client, "X-Live", &lv) == ESP_OK && lv)
+            s_live_secs = (int)strtol(lv, NULL, 10);
+    }
     esp_http_client_cleanup(client);
     return status;
 }
 
 static bool upload_bytes(const uint8_t *buf, size_t len, const char *kind,
                          const char *content_type, int hot, int global,
-                         const char *grid)
+                         const char *grid, const char *event)
 {
-    return upload_http(buf, len, kind, content_type, hot, global, grid, NULL, -1) == 200;
+    return upload_http(buf, len, kind, content_type, hot, global, grid,
+                       NULL, -1, event, NULL) == 200;
 }
 
 /* Draw 1px white outlines on the hot cells of a grayscale probe fb, so the
@@ -380,7 +407,7 @@ static void upload_probe(const camera_fb_t *fb, const zone_result_t *r)
         return;
     }
     bool ok = upload_bytes(jpg, jpg_len, "probe", "image/jpeg", r->hot_cells,
-                           r->global_mean, grid[0] ? grid : NULL);
+                           r->global_mean, grid[0] ? grid : NULL, NULL);
     ESP_LOGI(TAG, "probe %ux%u %u B -> %s (hot=%d global=%d)", fb->width, fb->height,
              (unsigned)jpg_len, ok ? "OK" : "FAIL", r->hot_cells, r->global_mean);
     free(jpg);
@@ -393,32 +420,30 @@ static esp_err_t probe_start(void)
     return err;
 }
 
-/* Phase 7a: stream the clip while the event is still unfolding. Called
- * right after the trigger still, camera already in photo (XGA JPEG)
- * mode. The Pi runs the SAME zone detector on these frames and answers
- * each chunk 200 (keep streaming) or 204 (clip over); any other answer
- * ends the burst too — the still is already stored, and hammering a
- * struggling link is what the probe-loop backoff exists to avoid. */
-static void capture_video_burst(void)
+/* Phase 7a/7c: stream a session to the Pi; camera already in photo (XGA
+ * JPEG) mode. skind "motion" = right after the trigger still; "ordered"
+ * = the gateway asked for live video (model verdict or browser request).
+ * The Pi runs the SAME zone detector on these frames and answers each
+ * chunk 200 (keep streaming) or 204 (session over); any other answer ends
+ * it too — the still is already stored, and hammering a struggling link
+ * is what the probe-loop backoff exists to avoid. */
+static void video_stream_session(const char *sid, const char *skind, int max_frames)
 {
     char *buf = heap_caps_malloc(VIDEO_CHUNK_MAX_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!buf) {
-        ESP_LOGW(TAG, "video: no %d KB chunk buffer; clip skipped",
+        ESP_LOGW(TAG, "video: no %d KB chunk buffer; session skipped",
                  VIDEO_CHUNK_MAX_BYTES / 1024);
         return;
     }
-    char sid[48];
-    snprintf(sid, sizeof(sid), "%s-%lld", s_device_id,
-             (long long)(esp_timer_get_time() / 1000000));
 
     unsigned total = 0, chunk = 0, frames = 0;
     size_t len = 0;
     const char *end = "cap";
     const int64_t t0 = esp_timer_get_time() / 1000;
-    while (total < VIDEO_MAX_FRAMES) {
+    while (total < (unsigned)max_frames) {
         /* one chunk, paced at VIDEO_FRAME_MS: 5 fps stays honest even
          * when the sensor could deliver more */
-        while (frames < VIDEO_CHUNK_FRAMES && total < VIDEO_MAX_FRAMES) {
+        while (frames < VIDEO_CHUNK_FRAMES && total < (unsigned)max_frames) {
             const int64_t due_ms = t0 + (int64_t)total * VIDEO_FRAME_MS;
             camera_fb_t *fb = esp_camera_fb_get();
             if (!fb) {
@@ -438,21 +463,26 @@ static void capture_video_burst(void)
         }
         if (!frames) break;
         int status = upload_http((unsigned char *)buf, len, "video", "image/jpeg",
-                                 -1, -1, NULL, sid, (int)chunk++);
-        if (status == 204) { end = "Pi quiet-stop"; break; }
+                                 -1, -1, NULL, sid, (int)chunk++, sid, skind);
+        if (status == 204) { end = "Pi stop"; break; }
         if (status != 200) { end = "link/err"; break; }
         len = 0;
         frames = 0;
     }
     const int64_t dur = esp_timer_get_time() / 1000 - t0;
-    ESP_LOGI(TAG, "video burst: %u frames, %u chunks, %lld ms (end=%s)",
-             total, chunk, (long long)dur, end);
+    ESP_LOGI(TAG, "video %s: %u frames, %u chunks, %lld ms (end=%s)",
+             skind, total, chunk, (long long)dur, end);
     heap_caps_free(buf);
 }
 
 /* Switch to photo mode, grab and upload one XGA JPEG, switch back to probe. */
 static bool capture_photo(const char *why, const zone_result_t *r)
 {
+    s_event_id[0] = 0;
+    snprintf(s_event_id, sizeof(s_event_id), "%s-%lld", s_device_id,
+             (long long)(esp_timer_get_time() / 1000000));
+    s_live_secs = 0;
+
     camera_stop();
     if (camera_start(PIXFORMAT_JPEG, PHOTO_FRAMESIZE, PHOTO_JPEG_QUALITY, PHOTO_SETTLE) != ESP_OK) {
         ESP_LOGE(TAG, "photo mode failed, back to probing");
@@ -463,7 +493,8 @@ static bool capture_photo(const char *why, const zone_result_t *r)
     camera_fb_t *fb = esp_camera_fb_get();
     bool ok = false;
     if (fb) {
-        ok = upload_bytes(fb->buf, fb->len, "photo", "image/jpeg", -1, -1, NULL);
+        ok = upload_bytes(fb->buf, fb->len, "photo", "image/jpeg", -1, -1, NULL,
+                         s_event_id);
         ESP_LOGI(TAG, "%s photo: %u bytes -> %s (hot=%d global=%d)", why, (unsigned)fb->len,
                  ok ? "OK" : "FAIL", r->hot_cells, r->global_mean);
         esp_camera_fb_return(fb);
@@ -471,10 +502,21 @@ static bool capture_photo(const char *why, const zone_result_t *r)
         ESP_LOGE(TAG, "%s photo: frame grab failed", why);
     }
 
-    /* Motion events also stream the event as a clip (phase 7a);
-     * heartbeats stay single photos and keep the power profile. */
+    /* Motion events also stream the event as a clip (phase 7a): the Pi
+     * keeps the session open past its quiet rules while a live window is
+     * open (a bird verdict just landed — the footage of the bird is what
+     * we want), and only records the clip if the decision model agrees.
+     * Heartbeats stay photo-only — but if the gateway has a live window
+     * open (browser request), the heartbeat answers X-Live and we stream
+     * ordered footage right away, camera already in photo mode. */
     if (ok && strcmp(why, "heartbeat") != 0) {
-        capture_video_burst();
+        video_stream_session(s_event_id, "motion", VIDEO_MAX_FRAMES);
+    } else if (ok && s_live_secs > 0) {
+        char osid[72];
+        snprintf(osid, sizeof(osid), "%s-live", s_event_id);
+        int max_frames = s_live_secs * 1000 / VIDEO_FRAME_MS;
+        video_stream_session(osid, "ordered",
+                             max_frames > VIDEO_MAX_FRAMES ? VIDEO_MAX_FRAMES : max_frames);
     }
 
     camera_stop();
@@ -484,6 +526,67 @@ static bool capture_photo(const char *why, const zone_result_t *r)
         camera_stop();
     }
     return ok;
+}
+
+/* Phase 7c: ask the gateway whether anyone wants live video right now.
+ * Body "N": stream N seconds starting now; "0": nothing pending. The
+ * decision of WHEN to stream lives on the Pi (model verdict or browser
+ * request); this device only ever obeys. */
+static int live_status_get(void)
+{
+    char url[192];
+    snprintf(url, sizeof(url), "%s/api/live_status?device=%s", INGEST_BASE, s_device_id);
+    esp_http_client_config_t cfg = {
+        .url = url,
+        .method = HTTP_METHOD_GET,
+        .timeout_ms = 8000,
+    };
+    esp_http_client_handle_t client = esp_http_client_init(&cfg);
+    if (!client) return 0;
+    int secs = 0;
+    if (esp_http_client_perform(client) == ESP_OK &&
+        esp_http_client_get_status_code(client) == 200) {
+        char body[16];
+        int n = esp_http_client_read(client, body, sizeof(body) - 1);
+        if (n > 0) {
+            body[n] = 0;
+            secs = (int)strtol(body, NULL, 10);
+        }
+    }
+    esp_http_client_cleanup(client);
+    return secs;
+}
+
+/* Dial, ask, and if live video is wanted: pay for it in this same dial
+ * (photo-mode camera, ordered session, back to probe). ~2 s of connect
+ * when the answer is no; the footage when the answer is yes. */
+static void maybe_live_poll(int64_t *last_poll_ms)
+{
+    *last_poll_ms = esp_timer_get_time() / 1000;
+    if (wifi_connect_start() != ESP_OK || !wifi_ready(WIFI_CONNECT_WAIT_MS)) {
+        wifi_power_down();
+        return;
+    }
+    int secs = live_status_get();
+    if (secs > 0) {
+        char sid[72];
+        snprintf(sid, sizeof(sid), "%s-%lld-o", s_device_id,
+                 (long long)(esp_timer_get_time() / 1000000));
+        camera_stop();
+        if (camera_start(PIXFORMAT_JPEG, PHOTO_FRAMESIZE, PHOTO_JPEG_QUALITY,
+                         PHOTO_SETTLE) == ESP_OK) {
+            int max_frames = secs * 1000 / VIDEO_FRAME_MS;
+            video_stream_session(sid, "ordered",
+                                 max_frames > VIDEO_MAX_FRAMES ? VIDEO_MAX_FRAMES : max_frames);
+        }
+        camera_stop();
+        while (probe_start() != ESP_OK) {
+            vTaskDelay(pdMS_TO_TICKS(2000));
+            camera_stop();
+        }
+        zone_motion_reset(&s_zone);  /* the reference frame went stale */
+    }
+    wifi_power_down();
 }
 
 static zone_cfg_t zone_config_from_header(int w, int h)
@@ -520,6 +623,7 @@ void app_main(void)
     ESP_LOGI(TAG, "probing at %.1f fps, heartbeat %d ms, wifi=dial-before-call", 1000.0f / PROBE_INTERVAL_MS, HEARTBEAT_MS);
 
     int64_t last_capture_ms = esp_timer_get_time() / 1000;
+    int64_t last_live_poll_ms = last_capture_ms;
     unsigned captures = 0, skips = 0, skip_streak = 0;
 
     while (true) {
@@ -604,6 +708,10 @@ void app_main(void)
                          (unsigned)s_zone.frames, captures, skips, r.hot_cells, r.global_mean);
             }
             esp_camera_fb_return(fb);
+            fb = NULL;
+            if (LIVE_POLL_MS > 0 && now_ms - last_live_poll_ms >= LIVE_POLL_MS) {
+                maybe_live_poll(&last_live_poll_ms);
+            }
         }
         vTaskDelay(pdMS_TO_TICKS(PROBE_INTERVAL_MS));
     }
