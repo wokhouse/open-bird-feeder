@@ -43,26 +43,39 @@ export function FrameGrid({
 
   // A zoom or rotation that crosses a readCols() breakpoint re-slices every row,
   // and the pixel scroll offset then points at different frames — the view the
-  // user was looking at is lost. Track the first visible card every frame
-  // (rAF sample = what the user actually saw, before any reflow moves it), so
-  // the layout effect below can put that same card back at the same position.
-  useEffect(() => {
-    const viewRef = { current: null as { path: string; top: number } | null }
-    let raf = 0
-    const sample = () => {
-      viewRef.current = null
-      const els = listRef.current?.querySelectorAll<HTMLElement>('[data-frame-path]')
-      for (const el of els ?? []) {
-        const top = el.getBoundingClientRect().top
-        if (top >= 0 && top < window.innerHeight) {
-          viewRef.current = { path: el.dataset.framePath as string, top }
-          break
-        }
+  // user was looking at is lost. Track the first visible card while scrolling
+  // (one rAF-coalesced sample per frame = what the user actually saw, before
+  // any reflow moves it) and snapshot it on resize, so the layout effect below
+  // can put that same card back at the same position.
+  const viewRef = useRef<{ path: string; top: number } | null>(null)
+  const anchorRef = useRef<{ path: string; top: number } | null>(null)
+  const restoreRaf = useRef(0)
+  const itemsRef = useRef(items)
+  itemsRef.current = items
+  const sampleView = () => {
+    viewRef.current = null
+    const els = listRef.current?.querySelectorAll<HTMLElement>('[data-frame-path]')
+    for (const el of els ?? []) {
+      const top = el.getBoundingClientRect().top
+      if (top >= 0 && top < window.innerHeight) {
+        viewRef.current = { path: el.dataset.framePath as string, top }
+        break
       }
-      raf = requestAnimationFrame(sample)
     }
-    raf = requestAnimationFrame(sample)
+  }
+  useEffect(() => {
+    let pending = 0
+    const onScroll = () => {
+      if (pending) return
+      pending = requestAnimationFrame(() => {
+        pending = 0
+        sampleView()
+      })
+    }
     const onResize = () => {
+      // Do NOT re-sample here: the browser has already reflowed by the time
+      // 'resize' fires, and the viewRef from the last scroll sample is the
+      // card the user was actually looking at in the OLD layout.
       const next = readCols()
       if (next !== colsRef.current && viewRef.current) {
         anchorRef.current = viewRef.current
@@ -70,9 +83,12 @@ export function FrameGrid({
       colsRef.current = next
       setCols(next)
     }
+    sampleView()
+    window.addEventListener('scroll', onScroll, { passive: true })
     window.addEventListener('resize', onResize)
     return () => {
-      cancelAnimationFrame(raf)
+      if (pending) cancelAnimationFrame(pending)
+      window.removeEventListener('scroll', onScroll)
       window.removeEventListener('resize', onResize)
     }
   }, [])
@@ -80,11 +96,13 @@ export function FrameGrid({
   // After the new cols commit: scroll so the anchor card sits at its old
   // viewport offset. The card may be outside the freshly-mounted virtual
   // window, so step toward its row in index space (estimate error cannot
-  // compound) and fine-tune from the real rect once it mounts.
-  const anchorRef = useRef<{ path: string; top: number } | null>(null)
-  const itemsRef = useRef(items)
-  itemsRef.current = items
+  // compound) and fine-tune from the real rect once it mounts. Late shifts
+  // are real — measureElement and Chrome's own scroll anchoring move content
+  // after the swap — so keep re-correcting for the full bounded window; the
+  // loop ends early only if the user takes over (wheel/touch/key), and any
+  // previous restore loop is cancelled first so two never fight over scrollBy.
   useLayoutEffect(() => {
+    cancelAnimationFrame(restoreRaf.current)
     const a = anchorRef.current
     if (!a) return
     anchorRef.current = null
@@ -92,19 +110,29 @@ export function FrameGrid({
     if (idx < 0) return
     const targetRow = Math.floor(idx / cols)
     const pitch = estimateRow(cols) + GAP
-    const restore = (tries: number) => {
-      const el = listRef.current?.querySelector<HTMLElement>(
+    let tries = 0
+    let abort = false
+    const yieldToUser = () => {
+      abort = true
+    }
+    window.addEventListener('wheel', yieldToUser, { passive: true })
+    window.addEventListener('touchstart', yieldToUser, { passive: true })
+    window.addEventListener('keydown', yieldToUser)
+    const restore = () => {
+      if (abort || tries++ > 45 || !listRef.current) {
+        window.removeEventListener('wheel', yieldToUser)
+        window.removeEventListener('touchstart', yieldToUser)
+        window.removeEventListener('keydown', yieldToUser)
+        return
+      }
+      const el = listRef.current.querySelector<HTMLElement>(
         `[data-frame-path="${CSS.escape(a.path)}"]`,
       )
       if (el) {
-        // Chrome re-measures freshly-mounted rows and applies its own scroll
-        // anchoring after the swap, both of which shift content later — keep
-        // re-correcting from the real rect for a bounded window after the
-        // swap, not just until the first zero delta.
         const d = el.getBoundingClientRect().top - a.top
         if (Math.abs(d) > 1) window.scrollBy(0, d)
       } else {
-        const rows = [...(listRef.current?.querySelectorAll<HTMLElement>('[data-index]') ?? [])]
+        const rows = [...(listRef.current.querySelectorAll<HTMLElement>('[data-index]') ?? [])]
           .map((r) => Number(r.dataset.index))
           .filter((n) => Number.isFinite(n))
         if (rows.length) {
@@ -114,9 +142,15 @@ export function FrameGrid({
           else if (targetRow > hi) window.scrollBy(0, (targetRow - hi + 3) * pitch)
         }
       }
-      if (tries < 45) requestAnimationFrame(() => restore(tries + 1))
+      restoreRaf.current = requestAnimationFrame(restore)
     }
-    restore(0)
+    restore()
+    return () => {
+      cancelAnimationFrame(restoreRaf.current)
+      window.removeEventListener('wheel', yieldToUser)
+      window.removeEventListener('touchstart', yieldToUser)
+      window.removeEventListener('keydown', yieldToUser)
+    }
   }, [cols])
   const scrollMargin =
     (listRef.current?.getBoundingClientRect().top ?? 0) + window.scrollY

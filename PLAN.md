@@ -497,18 +497,31 @@ JEV_BIRD_P, default threshold P(bird) >= 0.5).
    readCols() breakpoint re-slices every virtual row and the pixel scroll
    offset then points at different frames — the zoomed-at card vanished.
    FrameCard carries data-frame-path; FrameGrid samples the first visible
-   card every rAF (last painted frame = what the user actually saw), and on
-   a cols change a bounded (45-frame) rAF loop restores that card to its
-   saved viewport offset: index-space steps toward its row while unmounted
-   (estimate error cannot compound), real-rect correction once mounted, and
-   it keeps re-correcting for the window because measureElement and Chrome's
-   own scroll anchoring shift content after the swap. Measured on live
-   :8077 (6585 frames, ?view=all, scroll 12000, viewport 850↔400):
-   anchor kept both directions, drift 0px (before: anchor card unmounted
-   after re-slice). Selection/bulk pass re-run unchanged ("1 selected").
-   Known limit: the browser's own reflow (before JS sees the resize) can
+   card while scrolling (one rAF-coalesced sample per frame = what the user
+   actually saw, before any reflow moves it) and snapshots it when a resize
+   crosses a readCols() breakpoint. Do NOT re-sample inside the resize
+   handler: by then the browser has already reflowed and you capture the
+   wrong card (measured: 36-54px drift vs 0px). On a cols change a bounded
+   (45-frame) rAF loop restores that card to its saved viewport offset:
+   index-space steps toward its row while unmounted (estimate error cannot
+   compound, overshoots 3 rows to force the mount), real-rect correction
+   once mounted, re-correcting for the window because measureElement and
+   Chrome's own scroll anchoring shift content after the swap. The loop
+   yields on the first wheel/touch/keydown (user takes over) and a new
+   crossing cancels the previous loop so two never fight over scrollBy.
+   Measured on live :8077 (6585 frames, ?view=all, scroll 12000, viewport
+   850↔400): anchor kept both directions, drift 0px (before: anchor card
+   unmounted after re-slice); back-to-back double crossing (850→400→620)
+   also 0px; a user wheel inside the correction window sticks exactly.
+   Independent reviewer reproduced at scroll 12000 and confirmed the
+   pre-fix counterfactual. Harness lives at webui/e2e/zoom-anchor.js
+   (playwright-core + /usr/bin/chromium, run against a live :8077).
+   Selection/bulk pass re-run unchanged ("1 selected").
+   Known limits: the browser's own reflow (before JS sees the resize) can
    still move a partially-scrolled card a row's height; the anchor keeps
-   that card on screen regardless.
+   that card on screen regardless. Near the list end the browser clamps
+   scrollY under the shrunken document, so the exact offset cannot be
+   restored there — the anchor card still comes back into view.
 
 7. **Bird video: motion-gated clips, encoded on the Pi** — design DONE
    2026-11-09, code in progress. No SD card on the device: the ESP32 streams
