@@ -492,6 +492,24 @@ JEV_BIRD_P, default threshold P(bird) >= 0.5).
    retry in a fresh page (3rd attempt clean), the app range logic itself is
    index-consistent at click time.
 
+6k. **Zoom-reflow scroll anchoring** — DONE + verified 2026-11-11:
+   Mobile browsers that reflow on zoom change the CSS viewport; crossing a
+   readCols() breakpoint re-slices every virtual row and the pixel scroll
+   offset then points at different frames — the zoomed-at card vanished.
+   FrameCard carries data-frame-path; FrameGrid samples the first visible
+   card every rAF (last painted frame = what the user actually saw), and on
+   a cols change a bounded (45-frame) rAF loop restores that card to its
+   saved viewport offset: index-space steps toward its row while unmounted
+   (estimate error cannot compound), real-rect correction once mounted, and
+   it keeps re-correcting for the window because measureElement and Chrome's
+   own scroll anchoring shift content after the swap. Measured on live
+   :8077 (6585 frames, ?view=all, scroll 12000, viewport 850↔400):
+   anchor kept both directions, drift 0px (before: anchor card unmounted
+   after re-slice). Selection/bulk pass re-run unchanged ("1 selected").
+   Known limit: the browser's own reflow (before JS sees the resize) can
+   still move a partially-scrolled card a row's height; the anchor keeps
+   that card on screen regardless.
+
 7. **Bird video: motion-gated clips, encoded on the Pi** — design DONE
    2026-11-09, code in progress. No SD card on the device: the ESP32 streams
    the clip to sleepy, which stores and encodes it. The ESP32 has no video

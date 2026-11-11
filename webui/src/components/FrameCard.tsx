@@ -72,7 +72,10 @@ export default function FrameCard({
   const mark = (state: State) => act(() => setState(img.path, state))
 
   return (
-    <div className={cn('rounded-lg border bg-card text-card-foreground shadow-sm', selected && 'ring-2 ring-primary')}>
+    <div
+      data-frame-path={img.path}
+      className={cn('rounded-lg border bg-card text-card-foreground shadow-sm', selected && 'ring-2 ring-primary')}
+    >
       <div
         className="relative cursor-pointer"
         onClick={(e) => onToggleSelect(e.shiftKey)}

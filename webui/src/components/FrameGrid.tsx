@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { useWindowVirtualizer } from '@tanstack/react-virtual'
 import FrameCard from '@/components/FrameCard'
 import type { Img } from '@/lib/api'
@@ -38,13 +38,86 @@ export function FrameGrid({
   onToggleSelect: (path: string, shift: boolean) => void
 }) {
   const [cols, setCols] = useState(readCols)
+  const colsRef = useRef(cols)
+  const listRef = useRef<HTMLDivElement | null>(null)
+
+  // A zoom or rotation that crosses a readCols() breakpoint re-slices every row,
+  // and the pixel scroll offset then points at different frames — the view the
+  // user was looking at is lost. Track the first visible card every frame
+  // (rAF sample = what the user actually saw, before any reflow moves it), so
+  // the layout effect below can put that same card back at the same position.
   useEffect(() => {
-    const onResize = () => setCols(readCols())
+    const viewRef = { current: null as { path: string; top: number } | null }
+    let raf = 0
+    const sample = () => {
+      viewRef.current = null
+      const els = listRef.current?.querySelectorAll<HTMLElement>('[data-frame-path]')
+      for (const el of els ?? []) {
+        const top = el.getBoundingClientRect().top
+        if (top >= 0 && top < window.innerHeight) {
+          viewRef.current = { path: el.dataset.framePath as string, top }
+          break
+        }
+      }
+      raf = requestAnimationFrame(sample)
+    }
+    raf = requestAnimationFrame(sample)
+    const onResize = () => {
+      const next = readCols()
+      if (next !== colsRef.current && viewRef.current) {
+        anchorRef.current = viewRef.current
+      }
+      colsRef.current = next
+      setCols(next)
+    }
     window.addEventListener('resize', onResize)
-    return () => window.removeEventListener('resize', onResize)
+    return () => {
+      cancelAnimationFrame(raf)
+      window.removeEventListener('resize', onResize)
+    }
   }, [])
 
-  const listRef = useRef<HTMLDivElement | null>(null)
+  // After the new cols commit: scroll so the anchor card sits at its old
+  // viewport offset. The card may be outside the freshly-mounted virtual
+  // window, so step toward its row in index space (estimate error cannot
+  // compound) and fine-tune from the real rect once it mounts.
+  const anchorRef = useRef<{ path: string; top: number } | null>(null)
+  const itemsRef = useRef(items)
+  itemsRef.current = items
+  useLayoutEffect(() => {
+    const a = anchorRef.current
+    if (!a) return
+    anchorRef.current = null
+    const idx = itemsRef.current.findIndex((it) => it.path === a.path)
+    if (idx < 0) return
+    const targetRow = Math.floor(idx / cols)
+    const pitch = estimateRow(cols) + GAP
+    const restore = (tries: number) => {
+      const el = listRef.current?.querySelector<HTMLElement>(
+        `[data-frame-path="${CSS.escape(a.path)}"]`,
+      )
+      if (el) {
+        // Chrome re-measures freshly-mounted rows and applies its own scroll
+        // anchoring after the swap, both of which shift content later — keep
+        // re-correcting from the real rect for a bounded window after the
+        // swap, not just until the first zero delta.
+        const d = el.getBoundingClientRect().top - a.top
+        if (Math.abs(d) > 1) window.scrollBy(0, d)
+      } else {
+        const rows = [...(listRef.current?.querySelectorAll<HTMLElement>('[data-index]') ?? [])]
+          .map((r) => Number(r.dataset.index))
+          .filter((n) => Number.isFinite(n))
+        if (rows.length) {
+          const lo = Math.min(...rows)
+          const hi = Math.max(...rows)
+          if (targetRow < lo) window.scrollBy(0, -(lo - targetRow + 3) * pitch)
+          else if (targetRow > hi) window.scrollBy(0, (targetRow - hi + 3) * pitch)
+        }
+      }
+      if (tries < 45) requestAnimationFrame(() => restore(tries + 1))
+    }
+    restore(0)
+  }, [cols])
   const scrollMargin =
     (listRef.current?.getBoundingClientRect().top ?? 0) + window.scrollY
 
