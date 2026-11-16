@@ -26,7 +26,7 @@ import urllib.request
 
 TOPIC = os.environ.get("NTFY_TOPIC", "").strip()
 SERVER = os.environ.get("NTFY_SERVER", "https://ntfy.sh").rstrip("/")
-PUBLIC = os.environ.get("INGEST_PUBLIC_URL", "http://sleepy.tail643d2.ts.net:8077").rstrip("/")
+PUBLIC = os.environ.get("INGEST_PUBLIC_URL", "http://100.108.45.41:8077").rstrip("/")
 TIMEOUT = 5  # a push is a side effect; give up fast rather than stall a request
 
 

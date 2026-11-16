@@ -405,7 +405,7 @@ JEV_BIRD_P, default threshold P(bird) >= 0.5).
    JSON-body publish (POST {server}/, topic in body — sidesteps header
    encoding entirely), title "🐦 Bird at the feeder", body = HH:MM + p_bird +
    model, priority 3, tags [bird], click = the frame's /files/ URL on
-   http://sleepy.tail643d2.ts.net:8077 (INGEST_PUBLIC_URL). No inline image:
+   http://100.108.45.41:8077 (INGEST_PUBLIC_URL; click target switched from MagicDNS name to tailnet IP 2026-11-16). No inline image:
    ntfy.sh's nginx 414s query-string base64 above ~5 KB (measured: 4985-byte
    URI 200, 9699-byte 414; a 160px preview of a real frame is already at the
    edge), and the Attach header would make ntfy.sh itself fetch the
